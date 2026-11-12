@@ -2,12 +2,13 @@
 
 ## What is it?
 
-A **runtime** is the engine that actually serves a model. Two are supported:
+A **runtime** is the engine that actually serves a model. Three are supported:
 
 | Runtime | Use case | Key optimizations |
 |---------|----------|-------------------|
 | **vLLM** | LLMs, VLMs | NUMA auto-bind, AMX kernels, prefix caching, chunked prefill |
 | **OpenVINO (OVMS)** | Embedding, reranking, INT4/INT8 LLMs | OpenVINO IR, MediaPipe graph |
+| **vLLM XPU** (`vllm-xpu`) | LLMs on Intel Arc Pro B-Series (XPU) GPUs | PagedAttention; single-GPU models for now |
 
 Each engine is configured **once**, in the `runtimes:` section at the bottom of
 `models.yaml`. That is where you define the available versions and their container
@@ -131,6 +132,84 @@ Clients always use the OpenAI `/v1/` paths. For OpenVINO-served models the AI ga
 rewrites `/v1/` → `/v3/` internally, since OVMS uses the v3 API — this is invisible to
 callers. See [Inference Request Flow](../reference/request_flow.md).
 
+## vLLM XPU (Intel Arc Pro B-Series XPU)
+
+vLLM's XPU build, as a runtime of its own (`vllm-xpu`) rather than a version of the CPU
+`vllm` runtime: it ships as a separate image and runs as a plain `InferenceService` — one
+pod per model on the node GPU(s) it requests — instead of an `LLMInferenceService`.
+A **flat** runtime, like OpenVINO — no version axis.
+
+```yaml
+runtimes:
+  vllm-xpu:
+    env:
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"   # XPU contexts cannot survive fork()
+      TORCH_LLM_ALLREDUCE: "1"
+      CCL_ZE_IPC_EXCHANGE: "pidfd"
+      # ... telemetry off, SYCL kernel cache, oneCCL ring all-reduce — see models.yaml
+    categories:
+      llm:
+        args: [ --host, 0.0.0.0, --port, "8000", --dtype, float16, --block-size, "64",
+                --gpu-memory-utilization, "0.9", --max-model-len, "32768",
+                --enforce-eager, --disable-prefix-caching, --trust-remote-code ]
+        defaults: { cpu: 8, memory: "64Gi", gpu: 4 }
+```
+
+Plumbing in `model_manager/runtimes/vllm-xpu/values.yaml`:
+
+```yaml
+image: "vllm/vllm-openai-xpu:v0.33.0"
+device: gpu
+kind: InferenceService
+format: vllm-xpu
+runtime_name: vllm-xpu-runtime                              # ClusterServingRuntime to reference
+routing: aigateway
+serving_runtime_manifest: vllm-xpu/serving-runtime.yaml     # applied on first deploy
+accelerator_resource: "gpu.intel.com/xe"                    # extended resource the Intel GPU device plugin advertises
+```
+
+Weights are downloaded to the model PVC as for the CPU runtime and passed as
+`--model /models/<name>`. Per-model `args` override the category's (last flag wins),
+e.g. `--dtype bfloat16` for Llama.
+
+> [!NOTE]
+> Unlike the Helm-based XPU path of the Agent Toolkit 1.1 release, no host driver libraries
+> are mounted: the image's own Level Zero stack drives Arc Pro B70 cards, and the pod runs
+> with every Linux capability dropped.
+
+### `gpu` — accelerators per model
+
+Unlike the CPU runtimes, `vllm-xpu` models also set `gpu` (per model or category
+`defaults`): the number of accelerators requested via `accelerator_resource` in the
+container's `resources.limits` — one GPU per tensor-parallel rank, so keep it equal to the
+model's `--tensor-parallel-size` (the unit tests enforce this for the shipped catalog):
+
+```yaml
+- name: vllm-xpu-gpt-oss-20b
+  model_id: openai/gpt-oss-20b
+  runtime: vllm-xpu
+  gpu: 1
+  args: [ "--tensor-parallel-size", "1", "--dtype", "auto", "--disable-sliding-window",
+          "--max-model-len", "9216", "--max-num-batched-tokens", "9216" ]
+```
+
+`cpu`/`memory` still apply — they size the host-side process that drives the
+accelerators, not the accelerators themselves.
+
+### Prerequisites
+
+The cluster needs the [Intel GPU device plugin](https://github.com/intel/intel-device-plugins-for-kubernetes)
+deployed, so nodes advertise `gpu.intel.com/xe`; Kubernetes schedules a model's pod onto a
+node with enough free accelerators purely from the extended-resource request, no further
+node affinity needed.
+
+### CPU policy
+
+GPU/XPU runtimes (`device: gpu` in the runtime's `values.yaml`) are deployed with the
+`best-effort` CPU policy by default — NUMA-aware CPU pinning targets CPU-bound serving,
+and buys nothing for a process that is bound by its accelerators. Pass `--cpu-policy`
+explicitly to override.
+
 ## Which kind of Kubernetes object?
 
 The runtime's `kind` decides what `model-manager` creates:
@@ -139,6 +218,7 @@ The runtime's `kind` decides what `model-manager` creates:
 |---|---|---|
 | vLLM | `LLMInferenceService` | `model_manager/templates/llm-inference-service.yaml` |
 | OpenVINO | `InferenceService` | `model_manager/templates/inference-service.yaml` |
+| vLLM XPU | `InferenceService` | `model_manager/templates/inference-service-vllm-xpu.yaml` |
 
 The raw `ClusterServingRuntime` manifests stay as files under
 `model_manager/runtimes/<name>/`.

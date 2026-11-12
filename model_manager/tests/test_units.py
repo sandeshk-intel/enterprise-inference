@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from core import cli, config, download, k8s, nri_policy, policy, routing  # noqa: E402
+from core import cli, config, download, k8s, nri_policy, policy, renderer, routing  # noqa: E402
 from core.config import Catalog, Model  # noqa: E402
 from core.policy import _whole_cpus  # noqa: E402
 from core.renderer import dedupe_args, engine_args  # noqa: E402
@@ -624,3 +624,57 @@ def test_router_ip_node_fallback_needs_host_network(monkeypatch, host_network, w
     answers = {"deploy": host_network, "pods": "10.0.0.5"}
     monkeypatch.setattr(k8s, "out", lambda *a: answers.get(a[1], ""))
     assert platform.router_ip() == want
+
+SHIPPED_CATALOG = Path(__file__).resolve().parents[1] / "models.yaml"
+
+
+def _shipped(monkeypatch, name):
+    monkeypatch.setenv("MM_CONFIG", str(SHIPPED_CATALOG))
+    catalog = config.Catalog.load()
+    catalog.require_amx = True  # GPU runtimes must drop the AMX affinity even when the catalog asks for it
+    m = config.resolve(catalog, name, cli.Options())
+    return catalog, m
+
+
+def test_vllm_xpu_renders_gpu_inference_service(monkeypatch):
+    catalog, m = _shipped(monkeypatch, "vllm-xpu-gpt-oss-20b")
+    assert (m.kind, m.runtime, m.gpu, m.runtime_image) == (
+        "InferenceService", "vllm-xpu", "1", "vllm/vllm-openai-xpu:v0.33.0")
+    out = renderer.manifest(m, catalog, cli.Options(), {}, m.cpu, [])
+    assert "runtime: vllm-xpu-runtime" in out and "name: vllm-xpu\n" in out
+    assert '- "--model"\n        - "/models/vllm-xpu-gpt-oss-20b"' in out and "--model-path" not in out
+    assert 'gpu.intel.com/xe: "1"' in out and "AMXBF16" not in out
+    assert 'command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]' in out
+
+
+def test_vllm_xpu_per_model_args_override_category(monkeypatch):
+    catalog, m = _shipped(monkeypatch, "vllm-xpu-llama-3-1-8b")
+    args = dedupe_args(engine_args(m))
+    assert args[args.index("--dtype") + 1] == "bfloat16" and args.count("--dtype") == 1
+
+
+def test_gpu_catalog_models_request_one_gpu_per_tp_rank(monkeypatch):
+    # The device plugin hands out `gpu:` cards while the engine starts --tensor-parallel-size / --tp-size
+    # ranks; a mismatch either strands GPUs or fails at startup, so the shipped catalog must keep them equal.
+    monkeypatch.setenv("MM_CONFIG", str(SHIPPED_CATALOG))
+    catalog = config.Catalog.load()
+    checked = 0
+    for e in catalog.models:
+        rt = catalog.runtime_config(config.text(e.get("runtime") or catalog.runtime))
+        if config.text(rt.get("device")) != "gpu":
+            continue
+        args = [config.text(a) for a in e.get("args", [])]
+        flag = next(f for f in ("--tensor-parallel-size", "--tp-size") if f in args)
+        assert args[args.index(flag) + 1] == config.text(e["gpu"]), e["name"]
+        checked += 1
+    assert checked >= 2  # the vllm-xpu catalog models
+
+
+def test_vllm_xpu_runtime_manifest_gets_image(monkeypatch):
+    calls = []
+    monkeypatch.setattr(k8s, "out", lambda *a: "")
+    monkeypatch.setattr(k8s, "apply", lambda manifest, **kw: calls.append(manifest))
+    _, m = _shipped(monkeypatch, "vllm-xpu-gpt-oss-20b")
+    cli._install_runtime(m)
+    assert len(calls) == 1 and "name: vllm-xpu-runtime" in calls[0]
+    assert "image: vllm/vllm-openai-xpu:v0.33.0" in calls[0] and "{{" not in calls[0]

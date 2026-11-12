@@ -528,6 +528,35 @@ models:
       VLLM_CPU_SGL_KERNEL: "1"
       TORCHDYNAMO_DISABLE: "1"
 
+  # ── vLLM on Intel Arc Pro B-Series (XPU) GPUs ────────────────────────────────
+  #    GPU-backed runtime: `gpu` requests the accelerator extended resource (one
+  #    GPU per tensor-parallel rank, so keep it in sync with --tensor-parallel-size);
+  #    `cpu`/`memory` size the host-side process only. See runtimes.vllm-xpu below
+  #    and model_manager/runtimes/vllm-xpu/.
+  # Parameters follow the Arc Pro B70 model-qualification runs (9k context, TORCH_LLM_ALLREDUCE,
+  # eager mode, no prefix caching, sliding window off). Block size, eager mode, memory
+  # utilisation and the env come from runtimes.vllm-xpu below.
+  # Single-GPU (TP=1) models only.
+  - name: vllm-xpu-llama-3-1-8b
+    model_id: meta-llama/Llama-3.1-8B-Instruct
+    category: llm
+    runtime: vllm-xpu
+    cpu: 8
+    memory: 32Gi
+    gpu: 1
+    args: [ "--tensor-parallel-size", "1", "--dtype", "bfloat16", "--disable-sliding-window",
+            "--max-model-len", "9216" ]
+
+  - name: vllm-xpu-gpt-oss-20b
+    model_id: openai/gpt-oss-20b
+    category: llm
+    runtime: vllm-xpu
+    cpu: 8
+    memory: 32Gi
+    gpu: 1
+    args: [ "--tensor-parallel-size", "1", "--dtype", "auto", "--disable-sliding-window",
+            "--max-model-len", "9216", "--max-num-batched-tokens", "9216" ]
+
 
 # =============================================================================
 # Runtimes — per-engine deploy config (images, versions, env, categories)
@@ -621,3 +650,33 @@ runtimes:
         defaults: { cpu: 6, memory: "12Gi" }
       rerank:
         defaults: { cpu: 6, memory: "12Gi" }
+
+  # ── vLLM (Intel Arc Pro B-Series XPU) ─────────────────────────────────────────
+  # Flat runtime (no version axis) — image + plumbing live in
+  # runtimes/vllm-xpu/values.yaml. `gpu` (per model/category) requests the
+  # GPU-backed extended resource that values.yaml's accelerator_resource names
+  # (gpu.intel.com/xe) — one accelerator per tensor-parallel rank, so keep a
+  # model's --tensor-parallel-size arg and its `gpu:` count in sync.
+  vllm-xpu:
+    env:
+      VLLM_NO_USAGE_STATS: "1"
+      DO_NOT_TRACK: "1"
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"     # XPU contexts cannot survive fork()
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+      TORCH_LLM_ALLREDUCE: "1"                  # IPEX's fused all-reduce for tensor parallelism
+      SYCL_CACHE_PERSISTENT: "1"                # keep compiled kernels across restarts
+      ZES_ENABLE_SYSMAN: "1"                    # lets vLLM read free device memory
+      ZE_ENABLE_PCI_ID_DEVICE_ORDER: "1"        # stable GPU order across ranks
+      CCL_PROCESS_LAUNCHER: "none"              # ranks are vLLM workers, not an MPI job
+      CCL_WORKER_OFFLOAD: "0"
+      CCL_ZE_IPC_EXCHANGE: "pidfd"
+      CCL_ALLREDUCE: "ring"
+      TRITON_CACHE_DIR: "/tmp/.triton"
+      XDG_CACHE_HOME: "/tmp/.cache"
+      HOME: "/tmp"                              # non-root UID 1000 has no writable home in the image
+    categories:
+      llm:
+        args: [ --host, 0.0.0.0, --port, "8000", --dtype, float16, --block-size, "64",
+                --gpu-memory-utilization, "0.9", --max-model-len, "32768",
+                --enforce-eager, --disable-prefix-caching, --trust-remote-code ]
+        defaults: { cpu: 8, memory: "64Gi", gpu: 4 }

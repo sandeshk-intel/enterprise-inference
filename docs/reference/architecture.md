@@ -112,6 +112,7 @@ deploy:
 |---|---|---|
 | vLLM | `LLMInferenceService` | `epp` — EPP endpoint picker |
 | OpenVINO | `InferenceService` | `aigateway` |
+| vLLM XPU (Intel Arc Pro B-Series XPU) | `InferenceService` | `aigateway` |
 
 Both land in `llm_services_namespace` (default `llm-inference`).
 

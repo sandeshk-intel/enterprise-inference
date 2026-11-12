@@ -1,0 +1,86 @@
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: {{MODEL_NAME}}
+  namespace: {{NAMESPACE}}
+  labels:
+    app.kubernetes.io/name: {{MODEL_NAME}}
+    app.kubernetes.io/managed-by: model-manager{{EXTRA_LABELS}}
+spec:
+  predictor:
+{{NRI_ANNOTATIONS}}    minReplicas: {{REPLICAS}}
+    maxReplicas: {{REPLICAS}}
+    # supplementalGroups: the host's render (44) and video (990) groups, so the
+    # container can open /dev/dri/renderD* without running fully privileged.
+    securityContext:
+      supplementalGroups: [44, 990]
+    model:
+      modelFormat:
+        name: {{MODEL_FORMAT}}
+      runtime: {{RUNTIME_NAME}}
+      # The image's own Level Zero / IGC stack drives Arc Pro B-Series as-is, so no
+      # host driver libraries are mounted. ARGS (--model /models/<name>, served
+      # name, tensor-parallel size, XPU tuning) follow the entrypoint.
+      command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+      args: {{ARGS}}
+      env: {{ENV}}
+      resources:
+        requests:
+          cpu: "{{CPU}}"
+          memory: {{MEMORY}}
+          {{ACCELERATOR_RESOURCE}}: "{{GPU}}"
+        limits:
+          cpu: "{{CPU}}"
+          memory: {{MEMORY}}
+          {{ACCELERATOR_RESOURCE}}: "{{GPU}}"
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+          - ALL
+        # Non-root, as the namespace's PodSecurity "restricted" policy requires (KServe
+        # copies this onto its agent sidecar too). UID 1000 owns the downloaded weights;
+        # the render node is reachable via supplementalGroups above, so no root is needed.
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      # First start JIT-compiles XPU kernels on top of the weight load, so the startup
+      # probe allows up to an hour (180 x 20s); /health is cheap once the engine is up.
+      startupProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        periodSeconds: 20
+        timeoutSeconds: 10
+        failureThreshold: 180
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        periodSeconds: 15
+        timeoutSeconds: 10
+        failureThreshold: 3
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        periodSeconds: 30
+        timeoutSeconds: 10
+        failureThreshold: 5
+      volumeMounts:
+        - name: model-storage
+          mountPath: /models
+        - name: shm
+          mountPath: /dev/shm
+    volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: {{PVC_NAME}}
+      # Tensor-parallel workers exchange data through /dev/shm.
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+{{AFFINITY}}

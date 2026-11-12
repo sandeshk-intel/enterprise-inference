@@ -26,6 +26,7 @@ models:              # 2. The models you can deploy — one entry per model
 runtimes:            # 3. The engines themselves — images, versions, shared settings
   vllm: { ... }
   openvino: { ... }
+  vllm-xpu: { ... }
 ```
 
 What that gives you:
@@ -50,7 +51,7 @@ Applied to every model that doesn't override them.
 | `namespace` | `llm-inference` | Target namespace for deployments |
 | `runtime` | `vllm` | Engine used when a model omits one |
 | `replicas` | `1` | Replica count |
-| `require_amx` | `true` | Only schedule model pods on nodes with Intel® AMX. Relies on the NFD labels; NFD comes from the core platform layer's `node_feature_discovery` |
+| `require_amx` | `true` | Only schedule model pods on nodes with Intel® AMX. Relies on the NFD labels; NFD comes from the core platform layer's `node_feature_discovery`; skipped automatically for GPU/XPU runtimes (`vllm-xpu`) |
 
 ### `storage`
 
@@ -90,6 +91,7 @@ models:
 | `cpu` / `memory` | Resource requests (default: from the category). `cpu: auto` sizes CPU to a NUMA node — see [below](#cpu-auto) |
 | `replicas` | Replica count (default: 1) |
 | `tp` | Tensor parallelism — split the model across N CPU sockets |
+| `gpu` | Accelerators requested (default: from the category) — only for GPU/XPU runtimes (`vllm-xpu`); one per tensor-parallel rank |
 | `namespace` | Target namespace (default: `llm-inference`) |
 | `node` | Pin to a specific node |
 | `routing` | `epp` or `direct` |

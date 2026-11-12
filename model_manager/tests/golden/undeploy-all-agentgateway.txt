@@ -69,6 +69,12 @@
 [INFO ]  Undeploying qwen2-5-coder-14b-specdec
 [INFO ]  Waiting for qwen2-5-coder-14b-specdec pods to terminate (timeout: 180s)...
 [  OK ]  qwen2-5-coder-14b-specdec undeployed (all pods terminated, CPUs released)
+[INFO ]  Undeploying vllm-xpu-llama-3-1-8b
+[INFO ]  Waiting for vllm-xpu-llama-3-1-8b pods to terminate (timeout: 180s)...
+[  OK ]  vllm-xpu-llama-3-1-8b undeployed (all pods terminated, CPUs released)
+[INFO ]  Undeploying vllm-xpu-gpt-oss-20b
+[INFO ]  Waiting for vllm-xpu-gpt-oss-20b pods to terminate (timeout: 180s)...
+[  OK ]  vllm-xpu-gpt-oss-20b undeployed (all pods terminated, CPUs released)
 --- stderr
 --- kubectl
 $ kubectl delete LLMInferenceService qwen3-0-6b -n llm-inference --ignore-not-found
@@ -140,3 +146,9 @@ $ kubectl delete httproute aigw-qwen3-coder-30b-specdec -n llm-inference --ignor
 $ kubectl delete LLMInferenceService qwen2-5-coder-14b-specdec -n llm-inference --ignore-not-found
 $ kubectl delete configmap qwen2-5-coder-14b-specdec-chat-template -n llm-inference --ignore-not-found
 $ kubectl delete httproute aigw-qwen2-5-coder-14b-specdec -n llm-inference --ignore-not-found
+$ kubectl delete InferenceService vllm-xpu-llama-3-1-8b -n llm-inference --ignore-not-found
+$ kubectl delete configmap vllm-xpu-llama-3-1-8b-chat-template -n llm-inference --ignore-not-found
+$ kubectl delete httproute direct-vllm-xpu-llama-3-1-8b -n llm-inference --ignore-not-found
+$ kubectl delete InferenceService vllm-xpu-gpt-oss-20b -n llm-inference --ignore-not-found
+$ kubectl delete configmap vllm-xpu-gpt-oss-20b-chat-template -n llm-inference --ignore-not-found
+$ kubectl delete httproute direct-vllm-xpu-gpt-oss-20b -n llm-inference --ignore-not-found
