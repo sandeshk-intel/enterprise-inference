@@ -495,9 +495,8 @@ models:
       TORCHDYNAMO_DISABLE: "1"
 
   # ── Intel Inference Microservices (iim) images ────────────────────────────
-  # Intel's vLLM CPU build per model (IIM catalog v0.1.0), run as shipped: the iim
-  # runtime adds only the KV cache size and --max-model-len auto. Llama is gated
-  # (HF_TOKEN). Memory = weights + 16 GB KV cache + headroom.
+  # IIM catalog v0.1.0 on runtimes.iim; args only enable tool calling. Llama is gated (HF_TOKEN).
+  # Memory = weights + 16 GB KV cache + headroom.
   - name: iim-gemma-4-e4b
     model_id: google/gemma-4-E4B-it
     category: vlm
@@ -521,6 +520,7 @@ models:
     image: docker.io/intel/inference-xeon-meta-llama-llama-3.1-8b-instruct:0.1.0
     cpu: auto                        # one NUMA node per TP rank, per node
     memory: 40Gi
+    args: [ --enable-auto-tool-choice, --tool-call-parser, llama3_json ]
 
   - name: llama-3-2-3b
     model_id: meta-llama/Llama-3.2-3B-Instruct
@@ -529,6 +529,7 @@ models:
     image: docker.io/intel/inference-xeon-meta-llama-llama-3.2-3b-instruct:0.1.0
     cpu: auto                        # one NUMA node per TP rank, per node
     memory: 32Gi
+    args: [ --enable-auto-tool-choice, --tool-call-parser, llama3_json ]
 
   - name: iim-phi-4-reasoning
     model_id: microsoft/Phi-4-reasoning
@@ -553,6 +554,7 @@ models:
     image: docker.io/intel/inference-xeon-qwen-qwen3-30b-a3b:0.1.0
     cpu: auto                        # one NUMA node per TP rank, per node
     memory: 96Gi
+    args: [ --enable-auto-tool-choice, --tool-call-parser, hermes ]
 
   - name: iim-qwen3-4b
     model_id: Qwen/Qwen3-4B
@@ -561,6 +563,7 @@ models:
     image: docker.io/intel/inference-xeon-qwen-qwen3-4b:0.1.0
     cpu: auto                        # one NUMA node per TP rank, per node
     memory: 32Gi
+    args: [ --enable-auto-tool-choice, --tool-call-parser, hermes ]
 
   - name: iim-qwen3-8b
     model_id: Qwen/Qwen3-8B
@@ -569,6 +572,7 @@ models:
     image: docker.io/intel/inference-xeon-qwen-qwen3-8b:0.1.0
     cpu: auto                        # one NUMA node per TP rank, per node
     memory: 48Gi
+    args: [ --enable-auto-tool-choice, --tool-call-parser, hermes ]
 
   - name: iim-qwen3-vl-30b-a3b
     model_id: Qwen/Qwen3-VL-30B-A3B-Instruct
@@ -672,19 +676,14 @@ runtimes:
         defaults: { cpu: 6, memory: "12Gi" }
 
   # ── Intel Inference Microservices (IIM) ─────────────────────────────────────
-  # Intel's vLLM CPU builds, one image per model; KServe runs `vllm serve` from it.
-  # No engine env or args beyond the KV cache: vLLM's defaults, as IIM ships them.
-  # VLLM_CPU_KVCACHE_SPACE is required in a pod: unset, vLLM reserves 92% of the
-  # whole NUMA node, ignoring the pod's memory limit. --max-model-len auto uses the
-  # model's full context when it fits that cache, else the longest that does.
-  # ${KV_CACHE_GB} is filled from the category's kv_cache_gb (as for vllm).
+  # vLLM defaults as IIM ships them, plus the KV cache: unset, vLLM reserves 92% of
+  # the whole NUMA node and ignores the pod's memory limit.
   iim:
     image: "docker.io/intel/inference-xeon-base:0.1.0"   # --hfid deploys; catalog models set their own
     routing: epp
     autoscaling:                  # requests queued because the replica is saturated
       query: 'sum(vllm:num_requests_waiting{namespace="$namespace",model="$model"})'
       scale_target: 2
-    env: {}
     categories:
       llm:
         args: [ --max-model-len, auto ]
