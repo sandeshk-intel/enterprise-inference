@@ -144,44 +144,6 @@ models:
   #    a sizing estimate.
   #    `cpu: auto` sizes each model to the free physical cores of one NUMA
   #    node (minus reserved) per TP rank, on the smallest node; `--cpu N` overrides.
-  - name: llama-3-1-8b
-    model_id: meta-llama/Llama-3.1-8B-Instruct
-    category: llm
-    runtime: vllm
-    server_version: "0.28.0"
-    cpu: auto                        # one NUMA node per TP rank, per node
-    memory: 64Gi
-    args: [ "--block-size", "128", "--dtype", "bfloat16", "--distributed_executor_backend", "mp", "--enable_chunked_prefill", "--enforce-eager", "--max-num-batched-tokens", "2048", "--max-num-seqs", "256", "--enable-prefix-caching", "--enable-auto-tool-choice", "--tool-call-parser", "llama3_json", "--tensor-parallel-size", "1" ]
-    env:
-      VLLM_RPC_TIMEOUT: "100000"
-      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-      VLLM_ENGINE_ITERATION_TIMEOUT_S: "120"
-      TRITON_CACHE_DIR: "/tmp/.triton"
-      USER: "vllm"
-      VLLM_CPU_KVCACHE_SPACE: "40"
-      VLLM_CPU_NUM_OF_RESERVED_CPU: "0"
-      HF_HUB_DISABLE_XET: "1"
-      VLLM_CPU_SGL_KERNEL: "1"
-
-  - name: llama-3-2-3b
-    model_id: meta-llama/Llama-3.2-3B-Instruct
-    category: llm
-    runtime: vllm
-    server_version: "0.28.0"
-    cpu: auto                        # one NUMA node per TP rank, per node
-    memory: 64Gi
-    args: [ "--block-size", "128", "--dtype", "bfloat16", "--distributed_executor_backend", "mp", "--enable_chunked_prefill", "--enforce-eager", "--max-num-batched-tokens", "2048", "--max-num-seqs", "256", "--enable-prefix-caching", "--enable-auto-tool-choice", "--tool-call-parser", "llama3_json", "--tensor-parallel-size", "1" ]
-    env:
-      VLLM_RPC_TIMEOUT: "100000"
-      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-      VLLM_ENGINE_ITERATION_TIMEOUT_S: "120"
-      TRITON_CACHE_DIR: "/tmp/.triton"
-      USER: "vllm"
-      VLLM_CPU_KVCACHE_SPACE: "40"
-      VLLM_CPU_NUM_OF_RESERVED_CPU: "0"
-      HF_HUB_DISABLE_XET: "1"
-      VLLM_CPU_SGL_KERNEL: "1"
-
   - name: deepseek-r1-qwen-32b
     model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
     category: llm
@@ -532,6 +494,89 @@ models:
       VLLM_CPU_SGL_KERNEL: "1"
       TORCHDYNAMO_DISABLE: "1"
 
+  # ── Intel Inference Microservices (iim) images ────────────────────────────
+  # Intel's vLLM CPU build per model (IIM catalog v0.1.0), run as shipped: the iim
+  # runtime adds only the KV cache size and --max-model-len auto. Llama is gated
+  # (HF_TOKEN). Memory = weights + 16 GB KV cache + headroom.
+  - name: iim-gemma-4-e4b
+    model_id: google/gemma-4-E4B-it
+    category: vlm
+    runtime: iim
+    image: docker.io/intel/inference-xeon-google-gemma-4-e4b-it:0.1.0
+    cpu: auto                        # one NUMA node per TP rank, per node
+    memory: 56Gi
+
+  - name: iim-granite-3-2-2b
+    model_id: ibm-granite/granite-3.2-2b-instruct
+    category: llm
+    runtime: iim
+    image: docker.io/intel/inference-xeon-ibm-granite-granite-3.2-2b-instruct:0.1.0
+    cpu: auto                        # one NUMA node per TP rank, per node
+    memory: 32Gi
+
+  - name: llama-3-1-8b
+    model_id: meta-llama/Llama-3.1-8B-Instruct
+    category: llm
+    runtime: iim
+    image: docker.io/intel/inference-xeon-meta-llama-llama-3.1-8b-instruct:0.1.0
+    cpu: auto                        # one NUMA node per TP rank, per node
+    memory: 40Gi
+
+  - name: llama-3-2-3b
+    model_id: meta-llama/Llama-3.2-3B-Instruct
+    category: llm
+    runtime: iim
+    image: docker.io/intel/inference-xeon-meta-llama-llama-3.2-3b-instruct:0.1.0
+    cpu: auto                        # one NUMA node per TP rank, per node
+    memory: 32Gi
+
+  - name: iim-phi-4-reasoning
+    model_id: microsoft/Phi-4-reasoning
+    category: llm
+    runtime: iim
+    image: docker.io/intel/inference-xeon-microsoft-phi-4-reasoning:0.1.0
+    cpu: auto                        # one NUMA node per TP rank, per node
+    memory: 56Gi
+
+  - name: iim-mistral-7b-v0-2
+    model_id: mistralai/Mistral-7B-Instruct-v0.2
+    category: llm
+    runtime: iim
+    image: docker.io/intel/inference-xeon-mistralai-mistral-7b-instruct-v0.2:0.1.0
+    cpu: auto                        # one NUMA node per TP rank, per node
+    memory: 40Gi
+
+  - name: iim-qwen3-30b-a3b
+    model_id: Qwen/Qwen3-30B-A3B
+    category: llm
+    runtime: iim
+    image: docker.io/intel/inference-xeon-qwen-qwen3-30b-a3b:0.1.0
+    cpu: auto                        # one NUMA node per TP rank, per node
+    memory: 96Gi
+
+  - name: iim-qwen3-4b
+    model_id: Qwen/Qwen3-4B
+    category: llm
+    runtime: iim
+    image: docker.io/intel/inference-xeon-qwen-qwen3-4b:0.1.0
+    cpu: auto                        # one NUMA node per TP rank, per node
+    memory: 32Gi
+
+  - name: iim-qwen3-8b
+    model_id: Qwen/Qwen3-8B
+    category: llm
+    runtime: iim
+    image: docker.io/intel/inference-xeon-qwen-qwen3-8b:0.1.0
+    cpu: auto                        # one NUMA node per TP rank, per node
+    memory: 48Gi
+
+  - name: iim-qwen3-vl-30b-a3b
+    model_id: Qwen/Qwen3-VL-30B-A3B-Instruct
+    category: vlm
+    runtime: iim
+    image: docker.io/intel/inference-xeon-qwen-qwen3-vl-30b-a3b-instruct:0.1.0
+    cpu: auto                        # one NUMA node per TP rank, per node
+    memory: 96Gi
 
 # =============================================================================
 # Runtimes — per-engine deploy config (images, versions, env, categories)
@@ -625,3 +670,27 @@ runtimes:
         defaults: { cpu: 6, memory: "12Gi" }
       rerank:
         defaults: { cpu: 6, memory: "12Gi" }
+
+  # ── Intel Inference Microservices (IIM) ─────────────────────────────────────
+  # Intel's vLLM CPU builds, one image per model; KServe runs `vllm serve` from it.
+  # No engine env or args beyond the KV cache: vLLM's defaults, as IIM ships them.
+  # VLLM_CPU_KVCACHE_SPACE is required in a pod: unset, vLLM reserves 92% of the
+  # whole NUMA node, ignoring the pod's memory limit. --max-model-len auto uses the
+  # model's full context when it fits that cache, else the longest that does.
+  # ${KV_CACHE_GB} is filled from the category's kv_cache_gb (as for vllm).
+  iim:
+    image: "docker.io/intel/inference-xeon-base:0.1.0"   # --hfid deploys; catalog models set their own
+    routing: epp
+    autoscaling:                  # requests queued because the replica is saturated
+      query: 'sum(vllm:num_requests_waiting{namespace="$namespace",model="$model"})'
+      scale_target: 2
+    env: {}
+    categories:
+      llm:
+        args: [ --max-model-len, auto ]
+        env: { VLLM_CPU_KVCACHE_SPACE: "${KV_CACHE_GB}" }
+        defaults: { cpu: 8, memory: "32Gi", kv_cache_gb: 16 }
+      vlm:
+        args: [ --max-model-len, auto ]
+        env: { VLLM_CPU_KVCACHE_SPACE: "${KV_CACHE_GB}" }
+        defaults: { cpu: 16, memory: "48Gi", kv_cache_gb: 16 }
