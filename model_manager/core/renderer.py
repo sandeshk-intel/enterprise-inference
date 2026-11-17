@@ -165,13 +165,13 @@ def manifest(m: Model, catalog: Catalog, o, annotations: dict, cpu: str, cli_arg
         if m.chat_template:
             abort(f"Model '{m.name}': chat_template applies to vLLM only, not runtime '{m.runtime}'.")
         args = [_fill(a, m) for a in pick(m.container, "args", [])] + args
-    elif m.kind == "LLMInferenceService":
+    elif m.kind == "LLMInferenceService" or m.runtime == "vllm-xpu":
+        if m.runtime == "vllm-xpu":  # plain InferenceService: weights come from the PVC mount, not a storageUri
+            args = ["--model", f"/models/{m.name}"] + args
         args += ["--served-model-name", m.name]
         if m.chat_template:
             path = f"{CHAT_TEMPLATE_DIR}/chat_template.jinja" if inline_chat_template(m) else m.chat_template
             args += ["--chat-template", path]
-    elif m.runtime == "vllm-xpu":  # plain InferenceService: weights come from the PVC mount, not a storageUri
-        args = ["--model", f"/models/{m.name}", "--served-model-name", m.name] + args
     # AMX node-affinity targets CPU serving; GPU/XPU runtimes schedule on their accelerator instead.
     require_amx = catalog.require_amx and text(pick(m.rt, "device")) != "gpu"
     common = {
@@ -194,8 +194,13 @@ def manifest(m: Model, catalog: Catalog, o, annotations: dict, cpu: str, cli_arg
                                   f"          name: {m.name}-chat-template\n") if inline else ""))
     if m.kind == "InferenceService":
         name = {"vllm-xpu": "inference-service-vllm-xpu.yaml"}.get(m.runtime, "inference-service.yaml")
+        inline = inline_chat_template(m)
         return render(template(name), **common, MODEL_ID=m.model_id, PVC_NAME=catalog.pvc,
                       MODEL_FORMAT=text(pick(m.rt, "format")) or m.runtime,
                       RUNTIME_NAME=text(pick(m.rt, "runtime_name")) or f"{m.runtime}-runtime",
-                      GPU=m.gpu, ACCELERATOR_RESOURCE=text(pick(m.rt, "accelerator_resource")))
+                      GPU=m.gpu, ACCELERATOR_RESOURCE=text(pick(m.rt, "accelerator_resource")),
+                      CHAT_TEMPLATE_MOUNT=(f"        - name: chat-template\n          mountPath: {CHAT_TEMPLATE_DIR}\n"
+                                           f"          readOnly: true\n") if inline else "",
+                      CHAT_TEMPLATE_VOLUME=(f"      - name: chat-template\n        configMap:\n"
+                                            f"          name: {m.name}-chat-template\n") if inline else "")
     abort(f"Unknown model kind: {m.kind}")

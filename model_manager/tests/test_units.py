@@ -1695,3 +1695,14 @@ def test_a_node_must_fit_both_the_cpu_policy_and_the_requests(monkeypatch):
     m = Model(name="m", namespace="n", memory="16Gi", replicas="1")
     assert policy._request_errors(m, "8", False) == []                   # requests alone: a fits
     assert policy._request_errors(m, "8", False, Nri(), 1) != []         # combined: no node fits both
+
+
+def test_vllm_xpu_chat_template_is_passed_and_mounted(monkeypatch):
+    import yaml
+    catalog, m = _shipped(monkeypatch, "vllm-xpu-gpt-oss-20b")
+    m.chat_template = "{{ messages }}"
+    doc = yaml.safe_load(renderer.manifest(m, catalog, cli.Options(), {}, m.cpu, []))
+    model = doc["spec"]["predictor"]["model"]
+    assert model["args"][model["args"].index("--chat-template") + 1] == "/etc/chat-template/chat_template.jinja"
+    assert {"name": "chat-template", "mountPath": "/etc/chat-template", "readOnly": True} in model["volumeMounts"]
+    assert {"name": "chat-template", "configMap": {"name": f"{m.name}-chat-template"}} in doc["spec"]["predictor"]["volumes"]

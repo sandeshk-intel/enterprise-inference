@@ -160,8 +160,8 @@ runtimes:
       llm:
         args: [ --host, 0.0.0.0, --port, "8000", --dtype, float16, --block-size, "64",
                 --gpu-memory-utilization, "0.9", --max-model-len, "32768",
-                --enforce-eager, --disable-prefix-caching, --trust-remote-code ]
-        defaults: { cpu: 8, memory: "64Gi", gpu: 4 }
+                --enforce-eager, --no-enable-prefix-caching, --trust-remote-code ]
+        defaults: { cpu: 8, memory: "64Gi", gpu: 1 }
 ```
 
 Plumbing in `model_manager/runtimes/vllm-xpu/values.yaml`:

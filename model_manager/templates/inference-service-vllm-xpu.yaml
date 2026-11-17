@@ -74,7 +74,7 @@ spec:
           mountPath: /models
         - name: shm
           mountPath: /dev/shm
-    volumes:
+{{CHAT_TEMPLATE_MOUNT}}    volumes:
       - name: model-storage
         persistentVolumeClaim:
           claimName: {{PVC_NAME}}
@@ -83,4 +83,4 @@ spec:
         emptyDir:
           medium: Memory
           sizeLimit: 16Gi
-{{AFFINITY}}
+{{CHAT_TEMPLATE_VOLUME}}{{AFFINITY}}
