@@ -52,9 +52,13 @@
       {%- set _ = d.update({f.key: lookup('ansible.builtin.file', f.src, rstrip=false)}) -%}
       {%- endfor -%}
       {{ d }}
+  # Server-side: a client-side apply copies the whole code into an annotation, which is limited to 256 KiB.
   kubernetes.core.k8s:
     state: present
     apply: true
+    server_side_apply:
+      field_manager: ai-solutions-llm-services
+      force_conflicts: true
     definition:
       apiVersion: v1
       kind: ConfigMap
@@ -278,12 +282,21 @@
         - apiGroups: [config.nri]
           resources: [balloonspolicies]
           verbs: [get, list]
+        # NRI's per-NUMA balloon placement, for the CPU pre-flight.
+        - apiGroups: [topology.node.k8s.io]
+          resources: [noderesourcetopologies]
+          verbs: [get, list]
         - apiGroups: [storage.k8s.io]
           resources: [storageclasses]
           verbs: [get]
         - apiGroups: [serving.kserve.io]
           resources: [clusterservingruntimes, llminferenceservices, inferenceservices]
           verbs: [get, list]
+        # Autoscaled deploys check that KEDA is installed.
+        - apiGroups: [apiextensions.k8s.io]
+          resources: [customresourcedefinitions]
+          resourceNames: [scaledobjects.keda.sh]
+          verbs: [get]
     - apiVersion: rbac.authorization.k8s.io/v1
       kind: ClusterRoleBinding
       metadata: {name: model-manager}

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import math
@@ -48,7 +49,8 @@ def kubelet_config(node: str) -> dict | None:
 
 class BestEffort:
     """No pinning; the CFS scheduler places threads."""
-    name = "best-effort"
+    name = label = "best-effort"
+    counts_running_pods = False  # the pre-flight counts free capacity, which a running replica already holds
 
     def prepare(self, m: Model) -> None:
         """Normalise m.cpu/m.memory for the policy; may abort."""
@@ -61,13 +63,18 @@ class BestEffort:
         """Reasons the model cannot be placed (empty when it fits)."""
         return []
 
+    def node_slots(self, m: Model, tp: int, node: str) -> int | None:
+        """How many replicas of m the policy can place on `node` (None: no limit beyond CPU and memory requests)."""
+        return None
+
     def failure(self, m: Model, tp: int) -> str:
-        return ""
+        return placement_failure(m)
 
 
 class NriBalloons(BestEffort):
     """NRI balloons plugin: NUMA-aware balloons sized per tensor-parallel shard."""
     name = "nri-balloons"
+    counts_running_pods = True
     label = "NRI"
 
     def annotations(self, m: Model, tp: int) -> tuple[dict, str]:
@@ -76,26 +83,58 @@ class NriBalloons(BestEffort):
                 warn(line)
             return {f"{ANN}/type": "best-effort", f"{ANN}/reason": "nri-resolution-failed"}, m.cpu
         nri_policy.report_daemonset()
-        anns = nri_policy.build_annotations(tp, m.kind)
-        cpu = nri_policy.effective_cpu_request(int(m.cpu))
-        if cpu > 0 and str(cpu) != m.cpu:
-            info(f"NRI: Effective CPU {m.cpu} → {cpu} (hideHyperthreads active)", err=True)
-        return anns, str(cpu) if cpu > 0 else m.cpu
+        return nri_policy.build_annotations(tp, m.kind), m.cpu  # siblings are reserved: cpu is physical cores
+
+    def _errors(self, m: Model, tp: int) -> tuple[bool, list[str]]:
+        """(the gate passes, placement errors); with MM_NRI_PREFLIGHT=warn the gate passes despite errors."""
+        if not truthy(os.environ.get("MM_NRI_ENABLED", "true")):
+            return True, []
+        if not is_uint(m.cpu):
+            return False, [f"nri-balloons needs a whole number of CPUs, got cpu={m.cpu}"]
+        with contextlib.redirect_stderr(io.StringIO()):  # notes are noise here; errors are reported by the caller
+            result = nri_policy.preflight(int(m.cpu), tp, node=m.node, replicas=int(m.replicas))
+        return result["ok"], result["errors"]
 
     def preflight(self, m: Model, tp: int) -> list[str]:
-        if not truthy(os.environ.get("MM_NRI_ENABLED", "true")):
-            return []
-        if not is_uint(m.cpu):
-            return [f"nri-balloons needs a whole number of CPUs, got cpu={m.cpu}"]
-        with contextlib.redirect_stderr(io.StringIO()):  # notes are noise here; errors are reported below
-            result = nri_policy.preflight(int(m.cpu), tp, node=m.node, replicas=int(m.replicas))
-        return [] if result["ok"] else result["errors"]
+        ok, errors = self._errors(m, tp)
+        return [] if ok else errors
+
+    def node_slots(self, m: Model, tp: int, node: str) -> int | None:
+        if not truthy(os.environ.get("MM_NRI_ENABLED", "true")) or not is_uint(m.cpu) or \
+                nri_policy.preflight_disabled():
+            return None
+        with contextlib.redirect_stderr(io.StringIO()):
+            if node not in nri_policy.schedulable_nodes(tp):
+                return 0
+            return nri_policy.node_slots(node, int(m.cpu), tp, int(m.replicas))
 
     def failure(self, m: Model, tp: int) -> str:
         return (f"NRI pre-flight failed: not enough physical cores to place {m.name} (cpu={m.cpu} tp={tp} "
                 f"replicas={m.replicas}) without spilling onto reserved hyperthread-sibling cores. Lower "
                 "--cpu/--replicas, raise --tp, undeploy a model, or add a node. Override with MM_NRI_PREFLIGHT=warn "
                 "(proceed anyway) or MM_NRI_SKIP_PREFLIGHT=1 (skip check).")
+
+
+def _allocatable(m: Model) -> list[int] | None:
+    """Whole allocatable CPUs of each schedulable node (m.node only, when pinned); None when nodes can't be read.
+    Allocatable already excludes kube/system-reserved; exclusive CPUs cannot span nodes."""
+    nodes = k8s.get_json("node", m.node) if m.node else k8s.get_json("nodes")
+    if not nodes:
+        return None
+    return [whole_cpus(text(pick(pick(n.get("status"), "allocatable", {}), "cpu", "0")), floor=True)
+            for n in ([nodes] if m.node else nodes.get("items", []))
+            if not any(t.get("effect") == "NoSchedule" for t in pick(n.get("spec"), "taints", []))]
+
+
+def _replica_shortfall(alloc: list[int] | None, per_pod: int, replicas: int) -> str:
+    """Each replica needs per_pod CPUs on one node, so count whole replica slots per node."""
+    if replicas < 2 or alloc is None or per_pod < 1:  # [] is known: no schedulable node
+        return ""
+    slots = sum(a // per_pod for a in alloc)
+    if replicas > slots:
+        return (f"{replicas} replicas x {per_pod} CPUs: the schedulable nodes fit {slots} "
+                f"({sum(alloc)} allocatable CPUs; a replica cannot span nodes)")
+    return ""
 
 
 class KubeletStatic(BestEffort):
@@ -114,7 +153,7 @@ class KubeletStatic(BestEffort):
         elif tpc_env:
             warn(f"Invalid MM_KUBELET_THREADS_PER_CORE='{tpc_env}' — expected a positive integer; using "
                  "auto-detected default.")
-        cpu = _whole_cpus(m.cpu)
+        cpu = whole_cpus(m.cpu)
         if cpu < 1:
             abort(f"kubelet-static needs a numeric CPU quantity >= 1 for '{m.name}', got '{m.cpu}'. Set an integer "
                   "cpu in models.yaml or pass --cpu N.")
@@ -148,22 +187,16 @@ class KubeletStatic(BestEffort):
                 warn(f"Node '{node}' has cpuManagerPolicy={text(pick(cfg, 'cpuManagerPolicy', 'none'))} — not "
                      f"'static'. {m.name} will run WITHOUT exclusive CPUs. Re-run the solutions install with "
                      "kubernetes_cpu_policy=kubelet-static to reconfigure kubelet.")
-        nodes = k8s.get_json("node", m.node) if m.node else k8s.get_json("nodes")
-        if not nodes:
+        alloc = _allocatable(m)
+        if alloc is None:
             warn("Could not list nodes to verify CPU capacity — skipping the kubelet-static capacity check.")
             return []
-        # Allocatable already excludes kube/system-reserved; exclusive CPUs cannot span nodes.
-        alloc = [_whole_cpus(text(pick(pick(n.get("status"), "allocatable", {}), "cpu", "0")), floor=True)
-                 for n in ([nodes] if m.node else nodes.get("items", []))
-                 if not any(t.get("effect") == "NoSchedule" for t in pick(n.get("spec"), "taints", []))]
-        per_pod, replicas, largest = int(m.cpu) * tp, int(m.replicas), max(alloc, default=0)
-        if replicas > 1 and largest and per_pod * replicas > sum(alloc):
-            warn(f"kubelet-static: {replicas} replicas x {per_pod} CPUs = {per_pod * replicas} exceeds the cluster's "
-                 f"{sum(alloc)} allocatable CPUs — some replicas will stay Pending.")
+        per_pod, largest = int(m.cpu), max(alloc, default=0)  # the pod requests m.cpu; TP splits it
         if largest and per_pod > largest:
-            return [f"No schedulable node has {per_pod} allocatable CPUs (cpu={m.cpu} x tp={tp}); the largest offers "
-                    f"{largest}. Exclusive CPUs cannot span nodes, so the pod would stay Pending."]
-        return []
+            return [(f"No schedulable node has {per_pod} allocatable CPUs (cpu={m.cpu}); the largest offers "
+                     f"{largest}. Exclusive CPUs cannot span nodes, so the pod would stay Pending.")]
+        shortfall = _replica_shortfall(alloc, per_pod, int(m.replicas))
+        return [f"{shortfall}; the replicas that don't fit would stay Pending."] if shortfall else []
 
     def failure(self, m: Model, tp: int) -> str:
         return (f"kubelet-static pre-flight failed: cannot place {m.name} (cpu={m.cpu} tp={tp} replicas={m.replicas}) "
@@ -174,7 +207,13 @@ class KubeletStatic(BestEffort):
 POLICIES = {p.name: p for p in (NriBalloons, KubeletStatic, BestEffort)}
 
 
-def _whole_cpus(cpu: str, floor: bool = False) -> int:
+def placement_failure(m: Model) -> str:
+    return (f"Pre-flight failed: cannot place {m.name} (cpu={m.cpu} memory={m.memory} replicas={m.replicas}) "
+            "on the nodes it can use. Lower --cpu/--memory/--replicas/--max-replicas, undeploy a model, or add a "
+            "node. Override with MM_PREFLIGHT=warn (proceed anyway) or MM_SKIP_PREFLIGHT=1 (skip check).")
+
+
+def whole_cpus(cpu: str, floor: bool = False) -> int:
     """CPU quantity (8, 7.5, 7500m) in whole CPUs, rounded up (or down); 0 when unparseable."""
     if cpu.endswith("m") and is_uint(cpu[:-1]):
         value = int(cpu[:-1]) / 1000
@@ -220,18 +259,18 @@ def resolve_auto_cpu(policy: BestEffort, m: Model, tp: int) -> None:
     """
     if m.cpu != "auto":
         return
-    path = LIVE_CPU.get(m.kind)
-    live = k8s.out("get", m.kind, m.name, "-n", m.namespace, "-o", f"jsonpath={path}") if path else ""
+    # An OVMS upgrade from InferenceService keeps the CPU the old one runs with.
+    kinds = [m.kind] + (["InferenceService"] if m.kind == "LLMInferenceService" else [])
+    live = next((v for k in kinds if (v := k8s.out("get", k, m.name, "-n", m.namespace, "-o",
+                                                   f"jsonpath={LIVE_CPU[k]}"))), "")
     if live:
-        if isinstance(policy, NriBalloons) and is_uint(live):
-            live = str(nri_policy.model_cpu(int(live)))  # the request carries any hideHyperthreads doubling
         info(f"  CPU auto: keeping deployed value {live}")
         m.cpu = live
         return
     default = text(pick(pick(m.cat, "defaults", {}), "cpu", 8))
     if isinstance(policy, NriBalloons):
         cpu = nri_policy.auto_cpu(tp, m.node)
-        if cpu < _whole_cpus(default):
+        if cpu < whole_cpus(default):
             abort(f"cpu: auto — only {cpu} free CPUs per NUMA node for {m.name} (tp={tp}, need >= {default}). "
                   "Undeploy a model, add a node, or pass --cpu.")
         m.cpu = str(cpu)
@@ -240,16 +279,113 @@ def resolve_auto_cpu(policy: BestEffort, m: Model, tp: int) -> None:
     info(f"  CPU auto: {m.cpu} (tp={tp}, policy {policy.name})")
 
 
-def preflight_gate(policy: BestEffort, m: Model, tp: int) -> None:
-    """Abort a deploy that cannot be placed, before weights are downloaded."""
-    if truthy(os.environ.get("MM_SKIP_PREFLIGHT", "")):
+def _preflight_skipped() -> bool:
+    return truthy(os.environ.get("MM_SKIP_PREFLIGHT", ""))
+
+
+_MEM_UNITS = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40, "Pi": 2**50,
+              "k": 10**3, "K": 10**3, "M": 10**6, "G": 10**9, "T": 10**12, "P": 10**15}
+
+
+def mem_bytes(quantity: str) -> int:
+    """Memory quantity (16Gi, 512Mi, 2G, 1e9, 1048576) in bytes; 0 when unparseable."""
+    q = re.fullmatch(r"([0-9]*\.?[0-9]+)(e[0-9]+|[KMGTP]i|[kKMGTP])?", quantity.strip())
+    if not q:
+        return 0
+    value, unit = float(q.group(1)), q.group(2) or ""
+    return int(value * 10 ** int(unit[1:])) if unit.startswith("e") else int(value * _MEM_UNITS.get(unit, 1))
+
+
+def _cpu_millis(quantity: str) -> int:
+    if quantity.endswith("m") and is_uint(quantity[:-1]):
+        return int(quantity[:-1])
+    return int(float(quantity) * 1000) if re.fullmatch(r"[0-9]*\.?[0-9]+", quantity) else 0
+
+
+AMX_LABEL = "feature.node.kubernetes.io/cpu-cpuid.AMXBF16"
+
+
+def pod_requests(pod: dict) -> tuple[int, int]:
+    """(CPU millis, memory bytes) the scheduler reserves for a pod: its containers plus restartable (sidecar) init
+    containers, or the peak of the init sequence if higher, plus the pod overhead."""
+    spec = pick(pod, "spec", {})
+
+    def req(c: dict) -> tuple[int, int]:
+        r = pick(pick(c, "resources", {}), "requests", {})
+        return _cpu_millis(text(pick(r, "cpu", "0"))), mem_bytes(text(pick(r, "memory", "0")))
+    app = [sum(v) for v in zip((0, 0), *(req(c) for c in pick(spec, "containers", [])))]
+    sidecars, peak = [0, 0], [0, 0]
+    for c in pick(spec, "initContainers", []):
+        need = req(c)
+        if pick(c, "restartPolicy") == "Always":
+            sidecars = [a + b for a, b in zip(sidecars, need)]
+            peak = [max(p, s) for p, s in zip(peak, sidecars)]
+        else:
+            peak = [max(p, s + n) for p, s, n in zip(peak, sidecars, need)]
+    overhead = pick(spec, "overhead", {})
+    extra = (_cpu_millis(text(pick(overhead, "cpu", "0"))), mem_bytes(text(pick(overhead, "memory", "0"))))
+    return tuple(max(a + s, p) + e for a, s, p, e in zip(app, sidecars, peak, extra))
+
+
+def _request_errors(m: Model, cpu: str, amx: bool, policy: BestEffort | None = None, tp: int = 1) -> list[str]:
+    """The scheduler places a pod only where its CPU and memory requests are free: count, per node the model can
+    use, how many replicas fit beside the pods already there, and no more than the CPU policy can place there."""
+    per_cpu, per_mem, replicas = _cpu_millis(cpu), mem_bytes(m.memory), int(m.replicas)
+    if replicas < 1 or (per_cpu < 1 and per_mem < 1):
+        return []
+    nodes = k8s.get_json("node", m.node) if m.node else k8s.get_json("nodes")
+    pods = k8s.get_json("pods", "-A", "--field-selector", "status.phase!=Succeeded,status.phase!=Failed")
+    if not nodes or pods is None:
+        warn("Could not list nodes or pods — skipping the CPU/memory request check.")
+        return []
+    used: dict[str, list[int]] = {}
+    for p in pods.get("items", []):
+        node = pick(pick(p, "spec", {}), "nodeName")
+        if node:
+            used[node] = [a + b for a, b in zip(used.get(node, [0, 0]), pod_requests(p))]
+    slots, free = 0, []
+    for n in [nodes] if m.node else nodes.get("items", []):
+        name, labels = n["metadata"]["name"], pick(n["metadata"], "labels", {})
+        node_spec = pick(n, "spec", {})
+        if pick(node_spec, "unschedulable") or (amx and labels.get(AMX_LABEL) != "true") or \
+                any(t.get("effect") in ("NoSchedule", "NoExecute") for t in pick(node_spec, "taints", [])):
+            continue
+        alloc, (cpu_used, mem_used) = pick(pick(n, "status", {}), "allocatable", {}), used.get(name, [0, 0])
+        free_cpu = _cpu_millis(text(pick(alloc, "cpu", "0"))) - cpu_used
+        free_mem = mem_bytes(text(pick(alloc, "memory", "0"))) - mem_used
+        fits = [f // need for f, need in ((free_cpu, per_cpu), (free_mem, per_mem)) if need > 0]
+        limit = policy.node_slots(m, tp, name) if policy else None  # both must fit on the same node
+        slots += max(0, min(fits + ([limit] if limit is not None else [])))
+        free.append(f"{name} {max(0, free_cpu) // 1000} CPU / {max(0, free_mem) // 2**30}Gi")
+    if replicas <= slots:
+        return []
+    where = "; ".join(free) or "no schedulable node" + (" with AMX" if amx else "")
+    return [f"{replicas} replica(s) requesting {cpu} CPU and {m.memory} each: the nodes it can use have room for "
+            f"{slots} (free: {where}); the rest would stay Pending."]
+
+
+def preflight_gate(policy: BestEffort, m: Model, tp: int, cpu: str, running: int = 0, amx: bool = False) -> None:
+    """Abort, before weights are downloaded, a deploy whose replicas (up to the autoscaling maximum) do not all fit
+    now, so none is left Pending. `running` replicas already hold their place (a scaling-only change, or an upgrade
+    that frees the old pods first), so only the ones beyond them are checked."""
+    if _preflight_skipped():
         return
-    errors = policy.preflight(m, tp)
+    total = int(m.max_replicas or m.replicas)
+    extra = total - running
+    if extra < 1:
+        return
+    probe = dataclasses.replace(m, replicas=str(extra))
+    # A policy that checks allocatable, not free, capacity counts every replica, running ones too.
+    placed = probe if policy.counts_running_pods else dataclasses.replace(m, replicas=str(total))
+    placement = policy.preflight(placed, tp)
+    errors = placement + _request_errors(probe, cpu, amx, policy if policy.counts_running_pods else None, tp)
     if not errors:
         return
-    warn(f"{policy.label} pre-flight issues detected:")
+    what = f"{extra} replica(s)" + (f" beyond the {running} running" if running else "") + \
+        (f" (autoscaling up to {total})" if m.autoscaled else "")
+    warn(f"{policy.label} pre-flight: {m.name} cannot place {what}:")
     for e in errors:
         warn(f"  - {e}")
     if "warn" in (os.environ.get("MM_PREFLIGHT"), os.environ.get("MM_NRI_PREFLIGHT")):
         return warn(f"{policy.name} pre-flight failed but MM_PREFLIGHT=warn — proceeding anyway.")
-    abort(policy.failure(m, tp))
+    abort(policy.failure(placed, tp) if placement else placement_failure(probe))
