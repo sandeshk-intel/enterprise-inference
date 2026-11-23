@@ -31,6 +31,18 @@ QWEN36 = {"model_type": "qwen3_5_moe", "text_config": {
     "linear_num_key_heads": 16, "linear_num_value_heads": 32, "linear_key_head_dim": 128,
     "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "max_position_embeddings": 262144,
     "dtype": "bfloat16", "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 10}}
+# OpenVINO IR repos (config.json as published): Qwen3-4B, dense; Qwen3.5-2B, 6 full + 18 linear layers, 1 MTP layer.
+OV_QWEN3_4B = {"num_hidden_layers": 36, "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+               "max_position_embeddings": 40960, "torch_dtype": "bfloat16"}
+OV_QWEN35 = {"model_type": "qwen3_5", "vision_config": {"temporal_patch_size": 2},
+             "video_token_id": 248057,  # nosec B105 - a vocabulary token id from config.json, not a secret
+             "text_config": {
+                 "num_hidden_layers": 24, "num_attention_heads": 8, "num_key_value_heads": 2, "head_dim": 256,
+                 "linear_num_key_heads": 16, "linear_num_value_heads": 16, "linear_key_head_dim": 128,
+                 "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "max_position_embeddings": 262144,
+                 "mtp_num_hidden_layers": 1, "dtype": "bfloat16",
+                 "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 6}}
+OV_WEIGHTS = {"OpenVINO/Qwen3-4B-int4-ov": 2275935140, "OpenVINO/Qwen3.5-2B-int4-ov": 2113584276}
 WHISPER = {"model_type": "whisper", "is_encoder_decoder": True, "decoder_layers": 12, "decoder_attention_heads": 12,
            "d_model": 768, "max_target_positions": 448, "max_source_positions": 1500, "torch_dtype": "float32"}
 LLM_ARGS = ["--dtype", "bfloat16", "--max-num-seqs", "128", "--max-num-batched-tokens", "2048",
@@ -332,7 +344,8 @@ def hub(monkeypatch):
     for k, v in {"MM_PLATFORM": "kubernetes", "MM_LLMISVC_API_VERSION": "v1alpha2",
                  "MM_CPU_POLICY": "best-effort"}.items():
         monkeypatch.setenv(k, v)
-    configs = {"meta-llama/Llama-3.1-8B-Instruct": LLAMA_8B, "org/draft": LLAMA_1B}
+    configs = {"meta-llama/Llama-3.1-8B-Instruct": LLAMA_8B, "org/draft": LLAMA_1B,
+               "OpenVINO/Qwen3-4B-int4-ov": OV_QWEN3_4B, "OpenVINO/Qwen3.5-2B-int4-ov": OV_QWEN35}
     monkeypatch.setattr(cli, "hf_config", lambda repo, _: configs.get(repo))
     monkeypatch.setattr(cli, "hf_weight_bytes", lambda repo, _: gib(2.30 if repo == "org/draft" else 14.96))
     monkeypatch.setattr(k8s, "run", lambda *a, stdin=None: subprocess.CompletedProcess(a, 1, "", ""))
@@ -841,3 +854,56 @@ def test_hf_token_goes_on_stdin(monkeypatch):
     cmd, stdin = calls[0]
     assert "hf_secret" not in " ".join(cmd) and stdin == "Authorization: Bearer hf_secret\n" and ["-H", "@-"] == cmd[-3:-1]
     config._hf_json.cache_clear()
+
+
+# --- OVMS (OpenVINO Model Server): sized from the OpenVINO IR weights and graph.pbtxt's cache_size -----------------
+OV_K = config.runtime_sizing_defaults("openvino")
+
+
+def test_ovms_kv_per_token_follows_the_measured_u8_layout():
+    # Dense: 36 layers x K+V x 8 heads x (128 + 24) bytes = 85.5 KiB a token (measured 83.5).
+    assert sizer.ovms_bytes(OV_QWEN3_4B) == (36 * 2 * 8 * (128 + 24), 0)
+    # Hybrid: 6 full layers + the MTP layer, doubled for the linear states prefix caching keeps (measured 13.2 KiB),
+    # plus one linear state per request.
+    per_token, state = sizer.ovms_bytes(OV_QWEN35)
+    assert per_token == 7 * 2 * 2 * (256 + 24) * 2 and state == 18 * sizer._linear_state(
+        sizer.layout(OV_QWEN35)[0], 1, 2)
+
+
+def test_ovms_size_holds_one_full_context_request_by_default():
+    s = sizer.size_ovms(OV_QWEN3_4B, OV_WEIGHTS["OpenVINO/Qwen3-4B-int4-ov"], k=OV_K)
+    assert (s.tp, s.max_model_len, s.kv_gib, s.kv_by_tp) == (1, 40960, 4, {1: 4})  # 85.5 KiB x 40,960 = 3.3 GiB
+    assert s.memory_gi == math.ceil((s.weights_gib + 1.5) * 1.15 + 4 + 2) == 11
+    assert sizer.size_ovms(OV_QWEN3_4B, gib(2.12), streams=4, k=OV_K).kv_gib == math.ceil(4 * 36 * 2 * 8 * 152 * 40960 / GIB)
+    s = sizer.size_ovms(OV_QWEN35, OV_WEIGHTS["OpenVINO/Qwen3.5-2B-int4-ov"], k=OV_K)
+    assert (s.kv_gib, s.memory_gi) == (4, 12)
+    assert s.load_parts == {"image encoder": 1}  # OVMS doesn't profile a video at start-up
+
+
+def test_ovms_runtime_defaults_and_overrides():
+    assert (OV_K.overhead_gib, OV_K.multimodal_gib, OV_K.video_gib_per_1k, OV_K.quantized_repack) == (1.5, 1, 0, 0)
+    assert OV_K.headroom == 1.15 and OV_K.overrides("openvino") == {}
+    tuned = config.sizing_constants({"overhead_gib": 2}, "x", "openvino")
+    assert tuned.overhead_gib == 2 and tuned.multimodal_gib == 1 and tuned.overrides("openvino") == {"overhead_gib": 2}
+    assert config.sizing_constants(None, "x", "vllm") == config.SizingConstants()
+
+
+@pytest.mark.parametrize("cfg, weights, reason", [
+    (OV_QWEN3_4B, 0, "no OpenVINO IR weights"),
+    (None, 1, "gated"),
+    (DEEPSEEK_V2_LITE, 1, "MLA attention on OVMS"),
+    (WHISPER, 1, "encoder-decoder attention on OVMS"),
+    ({"num_hidden_layers": 2, "num_attention_heads": 2, "max_position_embeddings": 8, "linear_num_key_heads": 1,
+      "linear_num_value_heads": 1, "linear_key_head_dim": 1, "linear_value_head_dim": 1, "linear_conv_kernel_dim": 2,
+      "hidden_size": 4, "layer_types": ["linear_attention"] * 2}, 1, "no attention layers"),
+])
+def test_ovms_unsizable(cfg, weights, reason):
+    with pytest.raises(Unsupported, match=reason):
+        sizer.size_ovms(cfg, weights, k=OV_K)
+
+
+def test_hf_openvino_bytes_counts_the_repo_root_ir_weights(monkeypatch):
+    files = [{"rfilename": n, "size": z} for n, z in (("openvino_language_model.bin", 10), ("openvino_mtp_model.bin", 2),
+             ("openvino_language_model.xml", 99), ("tokenizer.json", 99), ("sub/openvino_x.bin", 99), ("model.bin", 99))]
+    monkeypatch.setattr(config, "hf_model_info", lambda *a, **k: {"siblings": files})
+    assert config.hf_openvino_bytes("x", "") == 12

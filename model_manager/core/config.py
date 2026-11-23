@@ -135,6 +135,15 @@ def hf_weight_bytes(model_id: str, proxy: str) -> int:
                if name.endswith(".safetensors") and "/" not in name and not name.startswith("consolidated"))
 
 
+def hf_openvino_bytes(model_id: str, proxy: str) -> int:
+    """Bytes of the repo-root OpenVINO IR weights (openvino_*.bin: the language model, embeddings, vision encoder,
+    MTP draft, tokenizers) that OVMS loads; 0 if unknown or none (a repo OVMS converts at pull time)."""
+    names = ((text(pick(f, "rfilename")), f) for f in pick(hf_model_info(model_id, proxy), "siblings", [])
+             if isinstance(f, dict))
+    return sum(int(pick(f, "size", 0)) for name, f in names
+               if name.startswith("openvino_") and name.endswith(".bin") and "/" not in name)
+
+
 # A copy of the weights in the publisher's own format (Meta's original/): vLLM loads the safetensors.
 HF_EXCLUDE = "original/*"
 
@@ -209,16 +218,28 @@ class SizingConstants:
     multimodal_gib: float = 4       # vision / audio encoder profiling at start-up
     video_gib_per_1k: float = 0.2   # native-video (temporal patch) profiling, per 1K tokens of context
 
-    def overrides(self) -> dict:
-        """The values that differ from the built-in defaults."""
-        default = SizingConstants()
+    def overrides(self, runtime: str = "") -> dict:
+        """The values that differ from the runtime's built-in defaults."""
+        default = runtime_sizing_defaults(runtime)
         return {k: v for k, v in vars(self).items() if v != getattr(default, k)}
 
 
-def sizing_constants(block: Any, where: str) -> SizingConstants:
-    """runtimes.<name>.sizing: any of SizingConstants' fields; unknown keys and out-of-range values abort."""
+# OVMS's own measured defaults (docs/reference/memory_sizing.md#openvino-model-server-ovms): its runtime is one
+# process (0.45-1.1 GiB measured beyond weights + KV); the vision encoder took 0.87 GiB on the first image; OVMS
+# doesn't profile a video at start-up; OpenVINO IR weights aren't repacked.
+RUNTIME_SIZING = {"openvino": {"overhead_gib": 1.5, "multimodal_gib": 1, "video_gib_per_1k": 0, "quantized_repack": 0}}
+
+
+def runtime_sizing_defaults(runtime: str) -> SizingConstants:
+    """The built-in sizing constants of a runtime: SizingConstants' defaults, and its own where it has any."""
+    return SizingConstants(**RUNTIME_SIZING.get(runtime, {}))
+
+
+def sizing_constants(block: Any, where: str, runtime: str = "") -> SizingConstants:
+    """runtimes.<name>.sizing over the runtime's defaults: any of SizingConstants' fields; unknown keys and
+    out-of-range values abort."""
     if block in (None, "", {}):
-        return SizingConstants()
+        return runtime_sizing_defaults(runtime)
     if not isinstance(block, dict):
         abort(f"{where} must be a mapping of {', '.join(vars(SizingConstants()))}")
     values = {}
@@ -231,14 +252,14 @@ def sizing_constants(block: Any, where: str) -> SizingConstants:
             kind = "a whole number" if key == "kv_min_gib" else "a number"
             abort(f"{where}.{key} must be {kind} >= {lowest}, got: {value!r}")
         values[key] = value
-    return SizingConstants(**values)
+    return SizingConstants(**{**RUNTIME_SIZING.get(runtime, {}), **values})
 
 
 @dataclass
 class Sizing:
-    """Memory of one pod for a vLLM model (core/sizer.py)."""
+    """Memory of one pod for a vLLM or OVMS model (core/sizer.py)."""
     weights_gib: float
-    kv_gib: int                               # VLLM_CPU_KVCACHE_SPACE, per TP worker
+    kv_gib: int                               # VLLM_CPU_KVCACHE_SPACE, per TP worker; OVMS: graph.pbtxt cache_size
     tp: int
     max_model_len: int
     needed_gib: float                         # weights + load + tp x (kv + overhead)

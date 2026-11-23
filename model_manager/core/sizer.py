@@ -219,17 +219,17 @@ def load_allowances(cfg: dict | None, weight_bytes: int, args: list[str], contex
                     k: SizingConstants = DEFAULTS) -> dict[str, float]:
     """The load allowances by name, in GiB: the repack copy of quantized weights; the encoder profiling of a
     multimodal model unless --limit-mm-per-prompt sets every modality it has to 0; a natively encoded video, which
-    grows with the context; and per-layer embedding tables."""
+    grows with the context; and per-layer embedding tables. An allowance whose constant is 0 is left out."""
     if not cfg:
         return {}
     parts = {}
-    if _quantized(cfg):
+    if _quantized(cfg) and k.quantized_repack:
         parts[f"quantized repack at {k.quantized_repack} x weights"] = k.quantized_repack * weight_bytes / GIB
     present = ["image", "video"] * ("vision_config" in cfg) + ["audio"] * ("audio_config" in cfg)
-    if any(_mm_limit(args, m) != 0 for m in present):
+    if k.multimodal_gib and any(_mm_limit(args, m) != 0 for m in present):
         parts["/".join(dict.fromkeys(m for m in present if m != "video") or ["video"]) + " encoder"] = k.multimodal_gib
     native_video = (cfg.get("vision_config") or {}).get("temporal_patch_size")
-    if native_video and cfg.get("video_token_id") is not None and _mm_limit(args, "video") != 0:
+    if k.video_gib_per_1k and native_video and cfg.get("video_token_id") is not None and _mm_limit(args, "video") != 0:
         parts[f"video profiling at {k.video_gib_per_1k} per 1K of {context} tokens"] = \
             k.video_gib_per_1k * context / 1024
     t = text_config(cfg)
@@ -287,6 +287,54 @@ def size(cfg: dict | None, weight_bytes: int, args: list[str], tp: int,
     return Sizing(weights_gib=weights / GIB, kv_gib=kv_gib, tp=tp, max_model_len=max_len,
                   needed_gib=needed, memory_gi=math.ceil(memory), load_gib=load, streams=streams,
                   kv_by_tp=kv_by_tp, load_parts=load_parts, k=k)
+
+
+# OVMS (OpenVINO GenAI) KV cache, measured on OVMS 2026.4.1 (memory_sizing.md#openvino-model-server-ovms):
+# u8 on CPU by default, with per-group scales beyond the head size (Qwen3-4B: 83.5 KiB a token = 20.4 bytes a vector
+# over u8). With prefix caching, which ovms --pull enables, the linear-attention layers keep their state with the
+# cached blocks, about as much again as the attention KV (Qwen3.5-2B: 13.2 against 6.85 KiB a token).
+OV_U8_EXTRA = 24
+OV_LINEAR_PREFIX_FACTOR = 2
+
+
+def ovms_bytes(cfg: dict) -> tuple[int, int]:
+    """KV bytes per token and per request (linear-attention state) of an OVMS servable. Full and sliding layers hold
+    the whole context (no window measured on OpenVINO), as does an MTP draft's attention layer."""
+    layers = layout(cfg)
+    if any(x.kind in ("mla", "cross") for x in layers):
+        raise Unsupported(f"{'MLA' if any(x.kind == 'mla' for x in layers) else 'encoder-decoder'} attention on "
+                          "OVMS (not measured)")
+    attention = [x for x in layers if x.kind in ("full", "sliding")]
+    if not attention:
+        raise Unsupported("no attention layers (linear attention only)")
+    full = next((x for x in attention if x.kind == "full"), attention[0])
+    attention += [full] * int(text_config(cfg).get("mtp_num_hidden_layers") or 0)
+    per_token = sum(2 * x.kv_heads * (x.head_dim + OV_U8_EXTRA) for x in attention)
+    linear = [x for x in layers if x.kind == "linear"]
+    if linear:
+        per_token *= OV_LINEAR_PREFIX_FACTOR
+    return per_token, sum(_linear_state(x, 1, 2) for x in linear)
+
+
+def size_ovms(cfg: dict | None, weight_bytes: int, streams: int = 0, k: SizingConstants = DEFAULTS) -> Sizing:
+    """Memory and graph.pbtxt cache_size for one OVMS pod: one process (TP 1), the model's own context (OVMS rejects
+    longer prompts), KV for kv_streams full-context requests. cache_size must hold one: OVMS answers a request its
+    cache cannot hold with an empty response."""
+    if not weight_bytes:
+        raise Unsupported("no OpenVINO IR weights (openvino_*.bin) on HuggingFace")
+    if cfg is None:
+        raise Unsupported("config.json not readable (gated repo without HF_TOKEN?)")
+    context = context_limit(cfg)
+    per_token, state = ovms_bytes(cfg)
+    streams = streams or DEFAULT_STREAMS
+    kv_gib = max(k.kv_min_gib, math.ceil((per_token * context + state) * streams / GIB))
+    load_parts = load_allowances(cfg, weight_bytes, [], context, k)
+    load, weights = sum(load_parts.values()), weight_bytes / GIB
+    needed = weights + load + kv_gib + k.overhead_gib
+    memory = (weights + load + k.overhead_gib) * k.headroom + kv_gib + k.margin_gib
+    return Sizing(weights_gib=weights, kv_gib=kv_gib, tp=1, max_model_len=context, needed_gib=needed,
+                  memory_gi=math.ceil(memory), load_gib=load, streams=streams, kv_by_tp={1: kv_gib},
+                  load_parts=load_parts, k=k)
 
 
 def served_context(cfg: dict | None, args: list[str]) -> int:
