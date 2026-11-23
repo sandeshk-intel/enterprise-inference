@@ -89,6 +89,9 @@ network:
 #                    by the download Job into the model's directory, so the pod
 #                    sees it at /mnt/models/draft — reference that path in args
 #                    (--speculative-config.model /mnt/models/draft).
+#   kv_offload:      vllm-cuda-kvshrink only: the KV-cache DDR pool per TP rank, in the pod or on
+#                    a pool node over RDMA (docs/customize/kv-offload.md)
+#                    {pool_gb: N, compression: cpu|off|qat|iaa|qat+iaa, remote: {node, ip, client_ip}}
 #   args: [ ... ]    extra engine args   (appended after category/version args)
 #   env:  { ... }    extra env vars      (merged over runtime env)
 #
@@ -593,6 +596,36 @@ models:
             --enable-auto-tool-choice, --tool-call-parser, qwen3_coder, --reasoning-parser, nemotron_v3 ]
     autodeploy: false
 
+  # ── KV-cache offload (runtime: vllm-cuda-kvshrink): see docs/customize/kv-offload.md ──
+
+  # Nemotron Mini 4B on 1 NVIDIA GPU; KV cache spilled to a 256 GiB DDR pool in the pod, CPU compression.
+  - name: nemotron-mini-4b-kvshrink
+    model_id: nvidia/Nemotron-Mini-4B-Instruct
+    category: llm
+    runtime: vllm-cuda-kvshrink
+    gpus: 1
+    args: [ --max-model-len, "4096" ]
+    kv_offload:
+      pool_gb: 256
+    autodeploy: false
+
+  # The same with the pool on a second node over RDMA (RoCE), compressed there with Intel QAT and IAA.
+  # Set node, the pool node and both NIC IPs to yours (rdma_shared_dev_plugin, intel_accel_plugins).
+  - name: nemotron-mini-4b-kvshrink-rdma
+    model_id: nvidia/Nemotron-Mini-4B-Instruct
+    category: llm
+    runtime: vllm-cuda-kvshrink
+    gpus: 1
+    node: gpu-node-1
+    args: [ --max-model-len, "4096" ]
+    kv_offload:
+      pool_gb: 400
+      compression: qat+iaa
+      qat_vfs: 8          # QAT VFs per rank: one per QAT PF of the pool node
+      iaa_wqs: 8          # IAA shared work queues: one per IAA device
+      remote: { node: pool-node-1, ip: 192.0.2.13, client_ip: 192.0.2.14 }
+    autodeploy: false
+
   # ── GPU examples (runtime: vllm-xpu): Intel Arc Pro B-Series (XPU), see runtimes.vllm-xpu below ──
   # Parameters follow the Arc Pro B70 model-qualification runs (9k context, TORCH_LLM_ALLREDUCE, eager mode,
   # no prefix caching, sliding window off). `gpus` is the per-pod GPU count and the default
@@ -746,6 +779,46 @@ runtimes:
       rerank:
         args: [ --dtype, bfloat16 ]
         defaults: { cpu: 4, memory: "16Gi", gpus: 1 }
+
+  # ── vLLM (NVIDIA GPU / CUDA) with KVShrink KV-cache offload ─────────────────
+  # vllm-cuda with IAXL built in; plumbing in runtimes/vllm-cuda-kvshrink/values.yaml,
+  # guide in docs/customize/kv-offload.md. No public image: build
+  # runtimes/vllm-cuda-kvshrink/docker, push it, and set its image below. IAXL and vLLM
+  # must be a matched pair: IAXL main 556c832 targets vLLM 0.29.0.
+  vllm-cuda-kvshrink:
+    default_version: "0.29.0"
+    env:
+      USER: "vllm"
+      HOME: "/tmp"
+      XDG_CACHE_HOME: "/tmp/.cache"
+      TRITON_CACHE_DIR: "/tmp/.triton"
+      TORCHINDUCTOR_CACHE_DIR: "/tmp/torchinductor_cache"
+      FLASHINFER_WORKSPACE_BASE: "/tmp"
+      HF_HUB_DISABLE_XET: "1"
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+      VLLM_NO_USAGE_STATS: "1"
+      IAXL_CACHE_DIR: "/tmp/kvshrink"
+      # The connector refuses to start without these (upstream setvars.sh defaults).
+      KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED: "1"
+      KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS: "-1"
+      KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC: "1"
+      KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP: "0-3:0,4-6:4,7-:8"
+      IAXL_CPU_ZIP_ENABLE: "1"
+      IAXL_QAT_ZIP_ENABLE: "0"
+      IAXL_IAA_ZIP_ENABLE: "0"
+      IAXL_DSA_GD_ENABLE: "0"
+      IAXL_RDMA_ENABLE: "0"
+      LD_PRELOAD: "/usr/local/lib/libiomp5.so:/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"
+    versions:
+      "0.29.0":
+        image: ""                   # <registry>/vllm-kvshrink:v0.29.0-556c832
+    # The connector rejects FlashInfer and does its own prefix caching.
+    categories:
+      llm:
+        args: [ --dtype, bfloat16, --no-enable-prefix-caching, --attention-backend, FLASH_ATTN, --block-size, "16",
+                --gpu-memory-utilization, "0.8", --kv-transfer-config,
+                '{"kv_connector":"KVShrinkConnector","kv_connector_module_path":"kvshrink.kvshrink_connector","kv_role":"kv_both"}' ]
+        defaults: { cpu: 16, memory: "64Gi", gpus: 1 }
 
   # ── vLLM (Intel Arc Pro B-Series XPU) ─────────────────────────────────────────
   # Flat runtime (no version axis); image + plumbing live in runtimes/vllm-xpu/values.yaml.

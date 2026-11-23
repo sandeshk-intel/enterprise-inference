@@ -1,0 +1,39 @@
+# =============================================================================
+# vLLM CUDA runtime with KVShrink KV-cache offload — low-level plumbing
+# =============================================================================
+# vllm-cuda with IAXL (intel/intel-accel-for-llm) built into the image (docker/ here): vLLM spills KV-cache
+# blocks from GPU memory into a DDR pool, in the pod or in a pool daemon on another node over RDMA. Deploy
+# config (image, env, category args) lives in models.yaml → runtimes.vllm-cuda-kvshrink; each model sets its
+# pool in kv_offload: (docs/customize/kv-offload.md).
+#
+# Plumbing keys: see runtimes/vllm-cuda/values.yaml, plus
+#   container   the image's entrypoint wrapper (CPU pinning from the pod's own cpuset, then `vllm serve`)
+#   kv_offload  defaults of a model's kv_offload: — scratch_gb and daemon_overhead_gb per rank, rdma_port,
+#               the extended resources of the RDMA/QAT/IAA device plugins, and pool_env: the block format
+#               of upstream setvars.sh, set on the pod that holds the pool
+# =============================================================================
+
+device: gpu
+kind: LLMInferenceService
+routing: epp
+accelerator_resource: nvidia.com/gpu
+accelerator_toleration_key: nvidia.com/gpu
+shm_size: 10Gi
+container:
+  command: ["/usr/local/bin/kvshrink-entrypoint.sh"]
+  args: ["/mnt/models", "--served-model-name", "$model", "--port", "8000"]
+  chat_template: true
+kv_offload:
+  scratch_gb: 8
+  daemon_overhead_gb: 32
+  rdma_port: 5555
+  resources:
+    rdma: rdma/hca
+    qat: qat.intel.com/dc
+    iaa: iaa.intel.com/wq-user-shared
+  pool_env:
+    IAXL_KV_DATA_SHUFFLE: "1"
+    IAXL_ZIP_EXPONENT_ONLY: "1"
+    IAXL_ZIP_LEVEL: "1"
+    IAXL_ZIP_SRC_CAP: "4194304"
+    IAXL_ZIP_DST_CAP: "4194304"

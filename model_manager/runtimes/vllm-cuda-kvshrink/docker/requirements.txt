@@ -1,0 +1,13 @@
+# Vendored from intel-accel-for-llm/requirements.txt (build-tooling deps for
+# the kvshrink package's pybind11/cmake/meson extension — vLLM itself comes
+# from the base image). Re-sync if the pinned KVSHRINK_GIT_REF changes.
+setuptools>=45
+wheel
+cmake
+pybind11
+intel-openmp
+xxhash
+matplotlib
+meson
+ninja
+tomlkit

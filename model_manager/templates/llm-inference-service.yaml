@@ -18,7 +18,7 @@ spec:
     route: {}
     scheduler: {}
   template:
-    containers:
+{{HOST_NETWORK}}    containers:
       - name: main
         image: {{IMAGE}}
 {{COMMAND}}        args: {{ARGS}}

@@ -14,6 +14,7 @@ from .config import Catalog, Model, gateway_ref, mm_path, pick, text
 from .ui import abort
 
 CHAT_TEMPLATE_DIR = "/etc/chat-template"
+HOST_NETWORK = "    hostNetwork: true\n    dnsPolicy: ClusterFirstWithHostNet\n"
 KV_CACHE_ENV = "VLLM_CPU_KVCACHE_SPACE"
 KV_CACHE_GB = "${KV_CACHE_GB}"
 
@@ -162,12 +163,19 @@ def gpu_toleration(m: Model, indent: int) -> str:
     return f"{pad}tolerations:\n{pad}  - key: {key}\n{pad}    operator: Exists\n{pad}    effect: NoSchedule" if key else ""
 
 
+def resource_lines(resources: dict, indent: int) -> str:
+    """Extended resources as `name: "count"` lines appended to a requests or limits map."""
+    return "".join(f'\n{" " * indent}{k}: "{v}"' for k, v in resources.items())
+
+
 def _gpu(m: Model, affinity: str) -> tuple[str, str]:
-    """The accelerator line appended to requests and limits, and the toleration; both empty on CPU."""
+    """The accelerator (and extra extended resource) lines appended to requests and limits, and the toleration; both
+    empty on CPU."""
     if not m.gpu:
         return "", ""
     toleration = gpu_toleration(m, 4)
-    return f'\n            {m.accel_resource}: "{m.gpus}"', ("\n" if affinity and toleration else "") + toleration
+    return (resource_lines({m.accel_resource: m.gpus, **m.extra_resources}, 12),
+            ("\n" if affinity and toleration else "") + toleration)
 
 
 def device_groups(m: Model) -> str:
@@ -262,7 +270,8 @@ def manifest(m: Model, catalog: Catalog, o, annotations: dict, cpu: str, cli_arg
                                        + [f"\n    {k}: {quote(v)}" for k, v in m.sizing.items()]),
             SCALING=_llmisvc_replicas(m),
             GATEWAY_NAME=gateway, GATEWAY_NAMESPACE=gateway_ns, CHAT_TEMPLATE_MOUNT=mounts,
-            CHAT_TEMPLATE_VOLUME=volumes, SUPPLEMENTAL_GROUPS=device_groups(m), GPU_RESOURCE=gpu_limit, TOLERATIONS=tolerations, CPU_LIMIT=cpu_limit))
+            CHAT_TEMPLATE_VOLUME=volumes, SUPPLEMENTAL_GROUPS=device_groups(m), GPU_RESOURCE=gpu_limit, TOLERATIONS=tolerations, CPU_LIMIT=cpu_limit,
+            HOST_NETWORK=HOST_NETWORK if m.host_network else ""))
     if m.kind == "InferenceService":
         return render(template("inference-service.yaml"), **common, MODEL_ID=m.model_id, PVC_NAME=catalog.pvc,
                       MODEL_FORMAT=text(pick(m.rt, "format")) or "openvino",

@@ -251,6 +251,32 @@ class Sizing:
 
 
 @dataclass
+class KvOffload:
+    """A model's KV-cache offload (core/kv_offload.py): a DDR pool per TP rank, in its own pod or, with pool_node, in a
+    pool daemon on that node reached over RDMA."""
+    pool_gb: int                              # IAXL_DDR_POOL_SIZE_GB, per rank
+    scratch_gb: int                           # IAXL_SCRATCH_POOL_SIZE_GB, per rank
+    compression: str                          # cpu | off | qat | iaa | qat+iaa
+    pool_env: dict                            # block format, on the pod that holds the pool
+    resources: dict                           # extended resource names: rdma, qat, iaa
+    qat_vfs: int = 0                          # QAT VFs per rank (QAT_POLICY)
+    qat_devices: str = ""                     # KVSHRINK_QAT_DEVICES, '|'-separated per rank
+    iaa_wqs: int = 0                          # IAA shared work queues
+    zip_threads: str = ""                     # IAXL_OMP_THREAD_NUM
+    cpu_zip_threads: str = ""                 # IAXL_CPU_ZIP_THREADS
+    pool_node: str = ""                       # remote mode: the node that runs the pool daemon
+    pool_ip: str = ""                         # its RDMA NIC IP
+    client_ip: str = ""                       # the GPU node's RDMA NIC IP
+    port: str = ""                            # IAXL_RDMA_DAEMON_PORT
+    pool_cpu: str = ""                        # daemon vCPUs
+    pool_memory_gi: int = 0                   # daemon memory: (pool + scratch + overhead) x TP
+
+    @property
+    def remote(self) -> bool:
+        return bool(self.pool_node)
+
+
+@dataclass
 class Model:
     name: str
     namespace: str
@@ -285,6 +311,10 @@ class Model:
     args: list = field(default_factory=list)
     env: dict = field(default_factory=dict)
     uri: str = ""
+    kv_offload: dict = field(default_factory=dict)   # the catalog's kv_offload:, resolved into kv at deploy
+    kv: KvOffload | None = None
+    host_network: bool = False
+    extra_resources: dict = field(default_factory=dict)  # extended resources beside the accelerator
 
     @property
     def autoscaled(self) -> bool:
@@ -407,7 +437,8 @@ def _from_catalog(catalog: Catalog, name: str, o: Any) -> Model:
               image=text(pick(e, "image")), node=text(pick(e, "node")), routing=text(pick(e, "routing")),
               chat_template=text(pick(e, "chat_template")).rstrip("\n"),  # as legacy $(jq) did
               env=shaped(f"model '{name}' env", pick(e, "env", {}), dict, catalog.path),
-              args=shaped(f"model '{name}' args", pick(e, "args", []), list, catalog.path))
+              args=shaped(f"model '{name}' args", pick(e, "args", []), list, catalog.path),
+              kv_offload=shaped(f"model '{name}' kv_offload", pick(e, "kv_offload", {}), dict, catalog.path))
     scaling = shaped(f"model '{name}' autoscaling", pick(e, "autoscaling", {}), dict, catalog.path)
     m.min_replicas, m.max_replicas, m.scale_target = (
         text(pick(scaling, k)) for k in ("min_replicas", "max_replicas", "scale_target"))

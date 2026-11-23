@@ -126,6 +126,7 @@ models:
 | `chat_template` | Inline Jinja or an absolute path → vLLM `--chat-template`. See [below](#chat-templates) |
 | `chat_template_file` | A Jinja file whose content is used as `chat_template`, so models share one template. See [below](#chat-templates) |
 | `draft_model_id` | Hugging Face repo of a speculative-decoding draft model (vLLM). See [below](#speculative-decoding) |
+| `kv_offload` | KV-cache DDR pool of a `vllm-cuda-kvshrink` model, in the pod or on a pool node over RDMA. See [KV-cache offload](kv-offload.md) |
 
 Plus the server binding, described next.
 

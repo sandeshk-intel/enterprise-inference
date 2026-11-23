@@ -257,6 +257,10 @@
         - apiGroups: [batch]
           resources: [jobs]
           verbs: [get, list, watch, create, delete]
+        # The KV pool daemon of a model with a remote KV-cache pool (<model>-kv-pool).
+        - apiGroups: [apps]
+          resources: [deployments]
+          verbs: [get, list, watch, create, update, patch, delete]
         - apiGroups: [""]
           resources: [pods, pods/log, persistentvolumeclaims, services]
           verbs: [get, list, watch]

@@ -1,0 +1,319 @@
+# rc: 0
+--- stdout
+[INFO ]  Deploying nemotron-mini-4b-kvshrink-rdma (LLMInferenceService)
+[INFO ]    Runtime: vllm-cuda-kvshrink @ 0.29.0 | Category: llm | Routing: epp
+[INFO ]    CPU: 16 | Memory: 64Gi | Replicas: 1
+[INFO ]    GPUs: 1 x nvidia.com/gpu
+[INFO ]    Node: gpu-node-1
+[INFO ]    CPU policy: n/a (GPU runtime — no CPU pinning)
+[INFO ]    KV offload: 400 GiB x 1 rank(s) on pool-node-1 (192.0.2.13:5555) over RDMA, compression qat+iaa
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: nemotron-mini-4b-kvshrink-rdma
+  namespace: llm-inference
+  labels:
+    app.kubernetes.io/name: nemotron-mini-4b-kvshrink-rdma
+    app.kubernetes.io/managed-by: model-manager
+spec:
+  model:
+    uri: pvc://model-store/nemotron-mini-4b-kvshrink-rdma
+  replicas: 1
+  router:
+    gateway:
+      refs:
+        - name: ai-gateway
+          namespace: llm-inference
+    route: {}
+    scheduler: {}
+  template:
+    hostNetwork: true
+    dnsPolicy: ClusterFirstWithHostNet
+    containers:
+      - name: main
+        image: registry.example.com/vllm-kvshrink:v0.29.0-556c832
+        command: ["/usr/local/bin/kvshrink-entrypoint.sh"]
+        args: 
+        - "/mnt/models"
+        - "--served-model-name"
+        - "nemotron-mini-4b-kvshrink-rdma"
+        - "--port"
+        - "8000"
+        - "--dtype"
+        - "bfloat16"
+        - "--no-enable-prefix-caching"
+        - "--attention-backend"
+        - "FLASH_ATTN"
+        - "--block-size"
+        - "16"
+        - "--gpu-memory-utilization"
+        - "0.8"
+        - "--kv-transfer-config"
+        - "{\"kv_connector\":\"KVShrinkConnector\",\"kv_connector_module_path\":\"kvshrink.kvshrink_connector\",\"kv_role\":\"kv_both\"}"
+        - "--max-model-len"
+        - "4096"
+        env: 
+        - name: FLASHINFER_WORKSPACE_BASE
+          value: "/tmp"
+        - name: HF_HUB_DISABLE_XET
+          value: "1"
+        - name: HF_HUB_ENABLE_HF_TRANSFER
+          value: "0"
+        - name: HOME
+          value: "/tmp"
+        - name: IAXL_CACHE_DIR
+          value: "/tmp/kvshrink"
+        - name: IAXL_CPU_ZIP_ENABLE
+          value: "1"
+        - name: IAXL_DSA_GD_ENABLE
+          value: "0"
+        - name: IAXL_IAA_ZIP_ENABLE
+          value: "0"
+        - name: IAXL_QAT_ZIP_ENABLE
+          value: "0"
+        - name: IAXL_RDMA_CLIENT_NIC_IPS
+          value: "192.0.2.14"
+        - name: IAXL_RDMA_DAEMON_NIC_IPS
+          value: "192.0.2.13"
+        - name: IAXL_RDMA_DAEMON_PORT
+          value: "5555"
+        - name: IAXL_RDMA_ENABLE
+          value: "1"
+        - name: IAXL_RDMA_TP_SIZE
+          value: "1"
+        - name: KVSHRINK_RDMA_LOCAL_IP
+          value: "192.0.2.14"
+        - name: KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED
+          value: "1"
+        - name: KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS
+          value: "-1"
+        - name: KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC
+          value: "1"
+        - name: KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP
+          value: "0-3:0,4-6:4,7-:8"
+        - name: LD_PRELOAD
+          value: "/usr/local/lib/libiomp5.so:/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"
+        - name: TORCHINDUCTOR_CACHE_DIR
+          value: "/tmp/torchinductor_cache"
+        - name: TRITON_CACHE_DIR
+          value: "/tmp/.triton"
+        - name: USER
+          value: "vllm"
+        - name: VLLM_NO_USAGE_STATS
+          value: "1"
+        - name: XDG_CACHE_HOME
+          value: "/tmp/.cache"
+        volumeMounts:
+          - name: shm
+            mountPath: /dev/shm
+        resources:
+          requests:
+            cpu: "16"
+            memory: 64Gi
+            nvidia.com/gpu: "1"
+            rdma/hca: "1"
+          limits:
+            memory: 64Gi
+            nvidia.com/gpu: "1"
+            rdma/hca: "1"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          failureThreshold: 120
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          failureThreshold: 12
+          periodSeconds: 10
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          failureThreshold: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          seccompProfile:
+            type: RuntimeDefault
+    securityContext:
+      seccompProfile:
+        type: RuntimeDefault
+    volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 10Gi
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                    - "gpu-node-1"
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nemotron-mini-4b-kvshrink-rdma-kv-pool
+  namespace: llm-inference
+  labels:
+    app.kubernetes.io/name: nemotron-mini-4b-kvshrink-rdma-kv-pool
+    app.kubernetes.io/part-of: nemotron-mini-4b-kvshrink-rdma
+    app.kubernetes.io/managed-by: model-manager
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nemotron-mini-4b-kvshrink-rdma-kv-pool
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nemotron-mini-4b-kvshrink-rdma-kv-pool
+        app.kubernetes.io/part-of: nemotron-mini-4b-kvshrink-rdma
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - "pool-node-1"
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pool
+          image: registry.example.com/vllm-kvshrink:v0.29.0-556c832
+          command: ["/usr/local/bin/kvshrink-entrypoint.sh"]
+          args: 
+            - "-X"
+            - "faulthandler"
+            - "-m"
+            - "iaxl.remote_pool.daemon"
+            - "--nic-ips"
+            - "192.0.2.13"
+            - "--port"
+            - "5555"
+            - "--tp-size"
+            - "1"
+          env: 
+            - name: FLASHINFER_WORKSPACE_BASE
+              value: "/tmp"
+            - name: HF_HUB_DISABLE_XET
+              value: "1"
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "0"
+            - name: HOME
+              value: "/tmp"
+            - name: IAXL_CACHE_DIR
+              value: "/tmp/kvshrink"
+            - name: IAXL_CPU_ZIP_ENABLE
+              value: "0"
+            - name: IAXL_DDR_POOL_SIZE_GB
+              value: "400"
+            - name: IAXL_DSA_GD_ENABLE
+              value: "0"
+            - name: IAXL_IAA_DEVICES
+              value: "auto"
+            - name: IAXL_IAA_INSTANCE_NUM
+              value: "32"
+            - name: IAXL_IAA_ZIP_ENABLE
+              value: "1"
+            - name: IAXL_KV_COMPRESSION
+              value: "1"
+            - name: IAXL_KV_DATA_SHUFFLE
+              value: "1"
+            - name: IAXL_OMP_THREAD_NUM
+              value: "12"
+            - name: IAXL_QAT_INSTANCE_NUM
+              value: "32"
+            - name: IAXL_QAT_ZIP_ENABLE
+              value: "1"
+            - name: IAXL_RDMA_ENABLE
+              value: "1"
+            - name: IAXL_SCRATCH_POOL_SIZE_GB
+              value: "8"
+            - name: IAXL_ZIP_DST_CAP
+              value: "4194304"
+            - name: IAXL_ZIP_EXPONENT_ONLY
+              value: "1"
+            - name: IAXL_ZIP_LEVEL
+              value: "1"
+            - name: IAXL_ZIP_SRC_CAP
+              value: "4194304"
+            - name: KVSHRINK_EXEC
+              value: "python3"
+            - name: KVSHRINK_QAT_DEVICES
+              value: "0,1,2,3,4,5,6,7"
+            - name: KVSHRINK_RDMA_LOCAL_IP
+              value: "192.0.2.13"
+            - name: KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED
+              value: "1"
+            - name: KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS
+              value: "-1"
+            - name: KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC
+              value: "1"
+            - name: KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP
+              value: "0-3:0,4-6:4,7-:8"
+            - name: LD_PRELOAD
+              value: "/usr/local/lib/libiomp5.so:/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"
+            - name: QAT_POLICY
+              value: "8"
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: "/tmp/torchinductor_cache"
+            - name: TRITON_CACHE_DIR
+              value: "/tmp/.triton"
+            - name: USER
+              value: "vllm"
+            - name: VLLM_NO_USAGE_STATS
+              value: "1"
+            - name: XDG_CACHE_HOME
+              value: "/tmp/.cache"
+          resources:
+            requests:
+              cpu: "16"
+              memory: 440Gi
+              rdma/hca: "1"
+              qat.intel.com/dc: "8"
+              iaa.intel.com/wq-user-shared: "8"
+            limits:
+              cpu: "16"
+              memory: 440Gi
+              rdma/hca: "1"
+              qat.intel.com/dc: "8"
+              iaa.intel.com/wq-user-shared: "8"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+--- stderr
+--- kubectl

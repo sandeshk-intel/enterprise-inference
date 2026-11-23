@@ -8,7 +8,7 @@ import json
 import math
 import os
 import re
-from typing import Any
+from typing import Any, Callable
 
 from . import k8s, nri_policy, sizer
 from .config import Model, Sizing, is_uint, pick, text, truthy
@@ -622,19 +622,29 @@ def _numa_error(m: Model, s: Sizing) -> str:
 def memory_gate(m: Model, s: Sizing | None) -> None:
     """Abort before the download when the pod's memory cannot hold the model, or a TP worker's share cannot fit in
     one NUMA node: either way vLLM would fail at load. Whether a node has the memory free is preflight_gate's check."""
-    if _preflight_skipped() or not s:
+    if not s:
         return
-    have = mem_bytes(m.memory) / sizer.GIB
-    errors = [f"memory {m.memory} is below the {math.ceil(s.needed_gib)}Gi {m.name} needs at tp={s.tp}: weights "
-              f"{s.weights_gib:.1f}{f' + load {s.load_gib:.1f}' if s.load_gib else ''} + KV {s.tp} x {s.kv_gib} + "
-              f"overhead {s.tp} x {s.k.overhead_gib:g} GiB. Raise "
-              "--memory or lower VLLM_CPU_KVCACHE_SPACE."] if have and s.needed_gib > have else []
-    errors += [e for e in (_numa_error(m, s),) if e]
+
+    def errors() -> list[str]:
+        have = mem_bytes(m.memory) / sizer.GIB
+        found = [f"memory {m.memory} is below the {math.ceil(s.needed_gib)}Gi {m.name} needs at tp={s.tp}: weights "
+                 f"{s.weights_gib:.1f}{f' + load {s.load_gib:.1f}' if s.load_gib else ''} + KV {s.tp} x {s.kv_gib} + "
+                 f"overhead {s.tp} x {s.k.overhead_gib:g} GiB. Raise "
+                 "--memory or lower VLLM_CPU_KVCACHE_SPACE."] if have and s.needed_gib > have else []
+        return found + [e for e in (_numa_error(m, s),) if e]
+    gate("Memory", m.name, errors)
+
+
+def gate(what: str, name: str, check: Callable[[], list[str]]) -> None:
+    """Run a pre-flight check unless MM_SKIP_PREFLIGHT=1: warn each error, then abort unless MM_PREFLIGHT=warn."""
+    if _preflight_skipped():
+        return
+    errors = check()
     if not errors:
         return
     for e in errors:
-        warn(f"Memory pre-flight: {e}")
+        warn(f"{what} pre-flight: {e}")
     if _preflight_warns():
-        return warn("Memory pre-flight failed but MM_PREFLIGHT=warn — proceeding anyway.")
-    abort(f"Memory pre-flight failed for {m.name}. Override with MM_PREFLIGHT=warn (proceed anyway) or "
+        return warn(f"{what} pre-flight failed but MM_PREFLIGHT=warn — proceeding anyway.")
+    abort(f"{what} pre-flight failed for {name}. Override with MM_PREFLIGHT=warn (proceed anyway) or "
           "MM_SKIP_PREFLIGHT=1 (skip check).")

@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import __version__, k8s, platform, renderer, routing, sizer
+from . import __version__, k8s, kv_offload, platform, renderer, routing, sizer
 from .config import (MM_DIR, Catalog, Model, Sizing, hf_config, hf_weight_bytes, hub_unreachable, is_uint, mm_path,
                      pick, resolve, resolve_autoscaling, text, truthy)
 from .download import download_weights
@@ -570,11 +570,14 @@ def deploy(o: Options, target: str) -> None:
     policy = GpuRuntime(catalog.pvc) if m.gpu else resolve_policy(o.cpu_policy, m.node)
     info(f"  CPU policy: {policy.name}")
     resolve_auto_cpu(policy, m, tp)
+    kv = kv_offload.resolve(m, tp)
+    if kv:
+        kv_offload.apply(m, kv, tp)
     policy.prepare(m)
     annotations, cpu = policy.annotations(m, tp)
     manifest = renderer.manifest(m, catalog, o, annotations, cpu, cli_args)
     if o.dry_run:
-        return print(manifest, end="")
+        return print(manifest + (f"---\n{kv_offload.pool_manifest(m, tp)}" if kv and kv.remote else ""), end="")
     if m.autoscaled:
         _require_autoscaling(m)
 
@@ -622,13 +625,19 @@ def deploy(o: Options, target: str) -> None:
                      "running pods' CPUs and memory are counted as free.")
         preflight_gate(policy, m, tp, cpu, running=running, amx=catalog.require_amx and not m.gpu)
         memory_gate(m, sizing)
+        if kv:
+            kv_offload.check(m, tp)
         k8s.ensure_storage(m.namespace, catalog.pvc)
         download_weights(m, catalog, cli_args, policy.download_nodes if m.gpu else ())
         if m.kind == "InferenceService":
             _install_runtime(m)
         retired = _retire_inference_service(m, wait_pods=True)
+        if kv:
+            kv_offload.reconcile(m, tp)
         k8s.apply(manifest, ssa=True)
         ok(f"Manifest applied: {m.kind}/{m.name} in {m.namespace}")
+    elif kv:
+        kv_offload.reconcile(m, tp)
     routing.register(m)
 
     timeout = int(o.wait_timeout or text(pick(m.rt, "wait_timeout")) or 900)  # model load + warmup is slow
@@ -800,6 +809,8 @@ def _remove(m: Model, wait: bool, timeout: int) -> None:
     """Delete m, its chat template and routes; with `wait`, until its pods are gone."""
     k8s.delete(m.kind, m.name, m.namespace)
     k8s.delete("configmap", f"{m.name}-chat-template", m.namespace, quiet=True)
+    if pick(m.rt, "kv_offload"):
+        k8s.delete("deployment", kv_offload.pool_name(m), m.namespace, quiet=True)
     routing.deregister(m)
     routing.litellm_deregister(m.name)
     if not wait:

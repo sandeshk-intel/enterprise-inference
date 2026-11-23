@@ -160,6 +160,11 @@ A model sets `gpus` (per pod; also the default `--tensor-parallel-size`):
 - **Single-GPU catalog models.** The shipped models use one GPU. Tensor parallelism (`gpus` > 1)
   needs oneCCL's `pidfd_getfd`, which the default seccomp profile may block on Arc Pro B70.
 
+### vLLM on NVIDIA GPU with KV-cache offload (`vllm-cuda-kvshrink`)
+
+`vllm-cuda` with KVShrink (IAXL) built in: vLLM spills KV-cache blocks into a DDR pool, in the pod or on a pool
+node over RDMA. A model sets `kv_offload:`; see [KV-cache offload](kv-offload.md).
+
 ## OpenVINO (OVMS)
 
 A **flat** runtime — there is no version axis. `server_version` does not apply, and
