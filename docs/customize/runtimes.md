@@ -165,6 +165,10 @@ A model sets `gpus` (per pod; also the default `--tensor-parallel-size`):
 A **flat** runtime — there is no version axis. `server_version` does not apply, and
 requesting one with `--server-version` aborts with a clear message.
 
+With `memory: auto`, an LLM published as OpenVINO IR gets its memory and `graph.pbtxt`
+`cache_size` sized from its config, which the download job writes with `ovms --configure`. See
+[Memory & KV-Cache Sizing](../reference/memory_sizing.md#openvino-model-server-ovms).
+
 ```yaml
 runtimes:
   openvino:

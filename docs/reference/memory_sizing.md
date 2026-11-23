@@ -13,8 +13,9 @@ documents are fetched, before the weight download.
 | `--hfid` without `--memory`, category `llm` | Yes, by default. Falls back to the category memory, with a warning, if it can't size the model |
 | Catalog model with a set `memory` (or none) | No: its `memory` and KV are used as is, and only [checked to fit](#pre-flight-checks) |
 
-Only **vLLM on CPU** (no runtime `container:`, `device: cpu`) and categories **`llm`** and
-**`vlm`** are sized. `memory: auto` on OpenVINO, GPU runtimes, `embed` or `rerank` is rejected.
+Only **vLLM on CPU** (no runtime `container:`, `device: cpu`) and **OpenVINO Model Server on
+CPU** ([its own rules](#openvino-model-server-ovms)), and categories **`llm`** and **`vlm`**, are
+sized. `memory: auto` on GPU runtimes, `embed` or `rerank` is rejected.
 
 > [!WARNING]
 > A **gated** repo's `config.json` is gated too (Llama, Gemma, Mistral). Set `HF_TOKEN`,
@@ -339,8 +340,64 @@ runtimes:
   compare: the runtime outside W + KV against `overhead_gib` (+ the headroom on the weights),
   and a multimodal model's extra against its allowance.
 
+## OpenVINO Model Server (OVMS)
+
+`memory: auto` (or `--hfid … --server openvino` without `--memory`) sizes an OVMS model's pod
+memory and its KV cache, which OVMS reads from `graph.pbtxt` (`cache_size`, in GiB) rather
+than from an env var. The model must be published as OpenVINO IR (the `OpenVINO/*` repos): a
+repo that `ovms --pull` converts (`weight_format`) is not sized, as its size isn't known before
+the download.
+
+```
+cache_size = max( 2, ceil( kv_per_token × context × kv_streams + linear state ) )      # GiB
+memory_gi  = ceil( (W + load + 1.5 GiB) × 1.15  +  cache_size  +  2 GiB )
+```
+
+```
+Memory: 12Gi (auto) = weights 2.0 + load 1.0 (1.0 image encoder) + overhead 1.5 (1 x 1.5) + headroom 0.7 (15%) + KV cache_size 4 + margin 2 GiB | KV for up to 1 x 262144 tokens
+```
+
+| Part | OVMS rule | Measured (OVMS 2026.4.1) |
+|---|---|---|
+| `W` | The repo-root `openvino_*.bin` files | OVMS memory-maps them, then copies the weights it uses into its own memory on the first request (int4 Qwen3-4B: +2.2 GiB for 2.12 GiB of weights) |
+| `kv_per_token` | Full and sliding layers, and an MTP draft layer: 2 × KV heads × (head_dim + 24) bytes | **u8** is the CPU default (the same as `KV_CACHE_PRECISION: u8`; f16 is 1.73× larger). Qwen3-4B: 83.5 KiB a token (rule: 85.5) |
+| Linear attention (Qwen3.5) | × 2, plus one state per request | With prefix caching, which `ovms --pull` turns on, the linear layers keep a state per cached block: Qwen3.5-2B 13.2 KiB a token, 6.85 without (rule: 15.3) |
+| Context | The model's own (`max_position_embeddings`) | OVMS rejects a longer prompt with HTTP 400 (`exceeds model max length`). It takes no `--max-model-len` |
+| `load` | Vision / audio encoder: 1 GiB. No video allowance, no quantized repack | A 1024 × 1024 image: +0.87 GiB. OVMS doesn't profile a video at start-up |
+| Runtime | 1.5 GiB (one process, TP 1) | 0.45–1.1 GiB beyond weights + KV, under load |
+
+How it applies:
+
+- **The download job writes `cache_size`** with `ovms --configure` on every deploy, also when
+  the weights are already on the store: the sized value, or `--pull`'s `0` without `memory: auto`.
+  The size is recorded in the `memory-sizing.model-manager.io/cache-size` annotation, and a
+  redeploy with the same inputs keeps it, as for vLLM ([Redeploys](#redeploys)).
+- **A fixed `cache_size` bounds the KV.** Its pages are used as needed, and under load the pod
+  settles at weights + `cache_size` + runtime. Requests beyond it wait: 16 × 4K against 4 GiB
+  all completed, 1–2 at a time.
+- **Pre-flight:** the fit check applies; the NUMA check doesn't (one process, no TP).
+- **Constants:** OVMS has its own defaults (`overhead_gib: 1.5`, `multimodal_gib: 1`,
+  `video_gib_per_1k: 0`, `quantized_repack: 0`), tuned in `runtimes.openvino.sizing`
+  ([Tuning the constants](#tuning-the-constants)).
+
+> [!WARNING]
+> **Two failure modes `memory: auto` avoids.** Without it, OVMS uses `--pull`'s `cache_size: 0`,
+> a KV that grows with the load, never shrinks, and has no bound below the pod limit, so a busy
+> pod is OOM-killed. And a fixed `cache_size` smaller than one request makes OVMS answer that
+> request with an **empty response** (HTTP 200, nothing logged): a 27K-token prompt against
+> 1 GiB. The sized `cache_size` always holds `kv_streams` full-context requests.
+
+Checked live with `memory: auto`, under 16 × 4K requests and a 27K-token recall prompt:
+
+| Deploy | Sized | Peak | Result |
+|---|---|---|---|
+| `qwen3-5-2b-ovms` (Qwen3.5-2B int4: hybrid, vision, MTP) | 12Gi, `cache_size` 4 | 6.2 GiB | Image served, all served, recall correct, no OOM |
+| OpenVINO/Qwen3-4B-int4-ov | 11Gi, `cache_size` 4 | 6.8 GiB | All served, recall correct, no OOM |
+
 ## Limits
 
+- **OVMS:** the KV rules come from two models (Qwen3-4B, Qwen3.5-2B). Sliding windows aren't
+  measured on OpenVINO and are sized as full; MLA and encoder-decoder models aren't sized.
 - **The constants are estimates:** 3 GiB per worker, × 1.15 and 2 GiB, the one-request default and the
   allowances. [Tune them](#tuning-the-constants) against the peak memory of real deploys. Text models peaked at
   81–93% of the sized limit, with 3–8 GiB of overhead per worker. The multimodal allowances

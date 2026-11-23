@@ -222,9 +222,9 @@ redirected to `/tmp` via the runtime's env (`HOME`, `XDG_CACHE_HOME`,
 
 You don't need a catalog entry to try a model. Point `--hfid` at any Hugging Face repo
 and model-manager infers the workload type (chat model, embedding, or reranker) from
-the model's metadata. Without `--memory`, a vLLM chat model's memory and KV cache are sized
-from its config ([how](../reference/memory_sizing.md)), as with `--memory auto`; when they
-cannot be, or for embeddings, rerankers and OpenVINO, the category memory is used:
+the model's metadata. Without `--memory`, a vLLM or OpenVINO chat model's memory and KV cache
+are sized from its config ([how](../reference/memory_sizing.md)), as with `--memory auto`; when
+they cannot be, or for embeddings and rerankers, the category memory is used:
 
 ```bash
 ./model-manager deploy --hfid Qwen/Qwen3-0.6B --cpu 8 --wait
