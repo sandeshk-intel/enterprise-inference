@@ -597,7 +597,10 @@ def _numa_node_gib(m: Model) -> tuple[float, int] | None:
 
 
 def _numa_error(m: Model, s: Sizing) -> str:
-    """vLLM binds each TP worker's memory to its NUMA node, so a worker's share must fit in one."""
+    """vLLM binds each TP worker's memory to its NUMA node, so a worker's share must fit in one. OVMS is one process
+    without TP, and not measured for NUMA binding: not checked."""
+    if m.ovms_on_cpu:
+        return ""
     # Weights and load allowances (repack, encoder profiling) split across the workers, each on its NUMA node.
     per_worker = (s.weights_gib + s.load_gib) / s.tp + s.kv_gib + s.k.overhead_gib
     numa = _numa_node_gib(m)

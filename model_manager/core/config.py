@@ -323,6 +323,11 @@ class Model:
         return not self.container and text(pick(self.rt, "device", "cpu")) == "cpu"
 
     @property
+    def ovms_on_cpu(self) -> bool:
+        """OpenVINO Model Server on a CPU device: memory: auto sizes its graph.pbtxt cache_size."""
+        return self.runtime == "openvino" and text(pick(self.rt, "device", "cpu")) == "cpu"
+
+    @property
     def run_as_user(self) -> str:
         """The serving container's user, which also owns the downloaded files so it can read them."""
         return text(pick(self.container, "run_as_user", 1000))
@@ -367,7 +372,7 @@ def resolve(catalog: Catalog, target: str, o: Any) -> Model:
         abort("No model specified. Use: model-manager <command> <model-name> or --hfid <hf/repo>")
 
     m.rt = catalog.runtime_config(m.runtime)
-    m.sizing_k = sizing_constants(pick(m.rt, "sizing"), f"runtimes.{m.runtime}.sizing")
+    m.sizing_k = sizing_constants(pick(m.rt, "sizing"), f"runtimes.{m.runtime}.sizing", m.runtime)
     m.kind = m.kind or text(pick(m.rt, "kind", "LLMInferenceService"))
     _select_image(catalog, m, o)
 
@@ -387,7 +392,7 @@ def resolve(catalog: Catalog, target: str, o: Any) -> Model:
     m.memory_auto = (o.memory or m.memory) == "auto"
     m.memory = "" if m.memory_auto else o.memory or m.memory
     # --hfid has no catalog memory to keep, so it is sized when it can be; the category default stays the fallback.
-    m.memory_auto_default = bool(o.id and not m.memory and not m.memory_auto and m.vllm_on_cpu
+    m.memory_auto_default = bool(o.id and not m.memory and not m.memory_auto and (m.vllm_on_cpu or m.ovms_on_cpu)
                                  and m.category == "llm")
     m.memory_auto = m.memory_auto or m.memory_auto_default
     m.memory = m.memory or text(pick(defaults, "memory", "16Gi"))

@@ -62,10 +62,11 @@ if [ -f "$cfg" ]; then
 fi"""
 
 # `ovms --pull` downloads and converts to OpenVINO IR; the servable is moved to /models/<name> with
-# the config_all.json the serving runtime loads via --config_path.
+# the config_all.json the serving runtime loads via --config_path. @CONFIGURE@ then sets an LLM's KV
+# cache_size in graph.pbtxt on every deploy, already prepared or not (memory: auto's size, else --pull's 0).
 OVMS_PREP = '''set -e
 export HOME=/models HF_HOME=/models/.hf-cache
-if [ -f @DIR@/.download_complete ]; then echo 'Model already prepared, skipping'; exit 0; fi
+if [ -f @DIR@/.download_complete ]; then echo 'Model already prepared, skipping the download'; else
 rm -rf '@STAGE@'; mkdir -p '@STAGE@'
 ovms --pull --source_model '@ID@' --model_repository_path '@STAGE@' --model_name '@NAME@' --task text_generation@WF@ --target_device @DEVICE@
 graph_dir=$(dirname $(find '@STAGE@' -name graph.pbtxt | head -1))
@@ -75,7 +76,13 @@ mv "$graph_dir"/* '@DIR@'/
 rm -rf '@STAGE@'
 printf '%s\\n' '{ "mediapipe_config_list": [ { "name": "@NAME@", "base_path": "." } ], "model_config_list": [] }' > '@DIR@/config_all.json'
 touch @DIR@/.download_complete
-echo "Prepared OVMS servable + config_all.json at @DIR@"'''
+echo "Prepared OVMS servable + config_all.json at @DIR@"
+fi@CONFIGURE@'''
+
+# OVMS answers a request its cache can't hold with an empty response, so a sized cache_size must reach graph.pbtxt.
+OVMS_CONFIGURE = '''
+ovms --configure --model_path '@DIR@' --task text_generation --target_device @DEVICE@ --cache_size @CACHE@
+echo "graph.pbtxt cache_size: @CACHE@ GiB"'''
 
 
 def _curl_ok(url: str, proxy: str) -> bool:
@@ -87,8 +94,12 @@ def _script(m: Model, cli_args: list[str], need_bytes: int = 0) -> str:
     if m.runtime == "openvino":
         # --weight-format converts raw HF weights; pre-converted OpenVINO/* repos reject it, so it is opt-in.
         wf = text(pick(m.cat, "weight_format"))
-        script = OVMS_PREP.replace("@WF@", f" --weight-format {wf}" if wf else "").replace(
-            "@STAGE@", f"/models/.pull-{m.name}").replace("@DEVICE@", os.environ.get("MM_OVMS_TARGET_DEVICE") or "CPU")
+        # LLMs only: --pull writes text_generation graphs; 0 is its own dynamic default.
+        cache = m.kv_cache_gb if m.memory_auto and m.kv_cache_gb else "0"
+        configure = OVMS_CONFIGURE.replace("@CACHE@", cache) if m.category in ("llm", "vlm") else ""
+        script = OVMS_PREP.replace("@CONFIGURE@", configure).replace(
+            "@WF@", f" --weight-format {wf}" if wf else "").replace("@STAGE@", f"/models/.pull-{m.name}").replace(
+            "@DEVICE@", os.environ.get("MM_OVMS_TARGET_DEVICE") or "CPU")
     else:
         space = SPACE_CHECK.replace("@NEED_KB@", str(-(-need_bytes // 1024))).replace(
             "@DRAFT_PENDING@", DRAFT_PENDING if m.draft_model_id else "") if need_bytes > 0 else ""

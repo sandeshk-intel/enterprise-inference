@@ -348,6 +348,7 @@ def hub(monkeypatch):
                "OpenVINO/Qwen3-4B-int4-ov": OV_QWEN3_4B, "OpenVINO/Qwen3.5-2B-int4-ov": OV_QWEN35}
     monkeypatch.setattr(cli, "hf_config", lambda repo, _: configs.get(repo))
     monkeypatch.setattr(cli, "hf_weight_bytes", lambda repo, _: gib(2.30 if repo == "org/draft" else 14.96))
+    monkeypatch.setattr(cli, "hf_openvino_bytes", lambda repo, _: OV_WEIGHTS.get(repo, 0))
     monkeypatch.setattr(k8s, "run", lambda *a, stdin=None: subprocess.CompletedProcess(a, 1, "", ""))
     return configs
 
@@ -476,10 +477,9 @@ def test_hfid_default_falls_back_when_it_cannot_size(hub, monkeypatch, capsys, r
     assert f"cannot size {m.name}" in err and "using the llm default 16Gi" in err
 
 
-@pytest.mark.parametrize("argv, memory", [(["--category", "embed"], "16Gi"),
-                                          (["--server", "openvino", "--category", "llm"], "16Gi")])
+@pytest.mark.parametrize("argv, memory", [(["--category", "embed"], "16Gi")])
 def test_hfid_default_is_only_for_vllm_llm(hub, capsys, argv, memory):
-    # memory: auto sizes vLLM llm models on CPU only; elsewhere --hfid keeps the category memory without an error.
+    # memory: auto sizes llm models on CPU only; elsewhere --hfid keeps the category memory without an error.
     m, s, main, env = _sized("--hfid", "org/other", *argv)
     assert not m.memory_auto_default and not m.memory_auto and main["resources"]["limits"]["memory"] == memory
     assert "CPU only" not in capsys.readouterr().err
@@ -498,7 +498,7 @@ def test_only_vllm_on_cpu_is_sized(hub, monkeypatch, capsys, runtime_config):
     m = config.resolve(cat, "", o)
     with pytest.raises(SystemExit):
         cli._apply_sizing(m, cat, o, [], 1)
-    assert "vLLM llm and vlm models on CPU only" in capsys.readouterr().err
+    assert "vLLM and OpenVINO llm and vlm models on CPU only" in capsys.readouterr().err
     o = cli.parse_args(["deploy", *LLAMA])
     assert cli._apply_sizing(config.resolve(cat, "", o), cat, o, [], 1) is None
 
@@ -858,6 +858,7 @@ def test_hf_token_goes_on_stdin(monkeypatch):
 
 # --- OVMS (OpenVINO Model Server): sized from the OpenVINO IR weights and graph.pbtxt's cache_size -----------------
 OV_K = config.runtime_sizing_defaults("openvino")
+OV4B = ("--hfid", "OpenVINO/Qwen3-4B-int4-ov", "--server", "openvino", "--category", "llm")
 
 
 def test_ovms_kv_per_token_follows_the_measured_u8_layout():
@@ -900,6 +901,72 @@ def test_ovms_runtime_defaults_and_overrides():
 def test_ovms_unsizable(cfg, weights, reason):
     with pytest.raises(Unsupported, match=reason):
         sizer.size_ovms(cfg, weights, k=OV_K)
+
+
+def test_ovms_memory_auto_deploy(hub, capsys):
+    m, s, main, env = _sized(*OV4B, "--memory", "auto")
+    assert main["resources"]["limits"]["memory"] == "11Gi" and m.kv_cache_gb == "4"
+    assert m.sizing[cli.SIZED_CACHE] == "4" and m.sizing[cli.SIZED_CONTEXT] == "40960"
+    assert "--max-model-len" not in main["args"] and "VLLM_CPU_KVCACHE_SPACE" not in env  # OVMS takes neither
+    out = capsys.readouterr().out
+    assert "Memory: 11Gi (auto)" in out and "+ KV cache_size 4 +" in out and "runtimes.openvino.sizing" not in out
+
+
+def test_ovms_hfid_is_sized_by_default_and_falls_back(hub, capsys):
+    m, s, main, env = _sized(*OV4B)
+    assert m.memory_auto_default and main["resources"]["limits"]["memory"] == "11Gi"
+    m, s, main, env = _sized("--hfid", "org/other", "--server", "openvino", "--category", "llm")
+    assert not m.memory_auto and main["resources"]["limits"]["memory"] == "16Gi" and s is None
+    assert "cannot size" in capsys.readouterr().err
+
+
+def test_ovms_without_memory_auto_keeps_its_memory(hub):
+    m, s, main, env = _sized("qwen3-5-2b-ovms")
+    assert s is None and main["resources"]["limits"]["memory"] == "16Gi" and not m.sizing
+
+
+def test_ovms_converted_at_pull_is_not_sized(hub, tmp_path, capsys):
+    cat = _catalog(tmp_path, model_id="Qwen/Qwen3-4B", runtime="openvino", memory="auto")
+    data = yaml.safe_load(cat.read_text())
+    data["runtimes"]["openvino"]["categories"]["llm"]["weight_format"] = "int4"  # a per-category conversion knob
+    cat.write_text(yaml.safe_dump(data))
+    with pytest.raises(SystemExit):
+        _sized("m", catalog=cat)
+    assert "weight_format" in capsys.readouterr().err
+
+
+def test_ovms_keeps_its_live_sizing(hub, monkeypatch, capsys):
+    o = cli.parse_args(["deploy", *OV4B, "--memory", "auto"])
+    m = config.resolve(Catalog(cli.MM_DIR / "models.yaml"), "", o)
+    inputs = cli._sizing_inputs(m, [], 1)
+    live = {"metadata": {"annotations": {cli.SIZING_INPUTS: inputs, cli.SIZED_CONTEXT: "40960", cli.SIZED_CACHE: "5"}},
+            "spec": {"template": {"containers": [{"resources": {"limits": {"memory": "13Gi"}}, "env": []}]}}}
+    monkeypatch.setattr(k8s, "get_json", lambda *a: live)
+    o = cli.parse_args(["deploy", *OV4B])
+    m = config.resolve(Catalog(cli.MM_DIR / "models.yaml"), "", o)
+    assert cli._apply_sizing(m, Catalog(cli.MM_DIR / "models.yaml"), o, [], 1) is None
+    assert (m.memory, m.kv_cache_gb, m.max_model_len) == ("13Gi", "5", "")  # no --max-model-len for OVMS
+    assert "cache_size 5 GiB" in capsys.readouterr().out
+
+
+def test_ovms_download_job_writes_the_cache_size(hub):
+    from core import download
+    m, s, main, env = _sized(*OV4B, "--memory", "auto")
+    script = download._script(m, [])
+    assert "--cache_size 4" in script and "ovms --configure --model_path '/models/qwen3-4b-int4-ov'" in script
+    # Already prepared: the download is skipped, the cache_size still written.
+    assert script.index("skipping the download") < script.index("fi\novms --configure")
+    m, s, main, env = _sized("qwen3-5-2b-ovms")
+    assert "--cache_size 0" in download._script(m, [])  # --pull's own dynamic default, also after a sized deploy
+    m.category = "embed"
+    assert "--configure" not in download._script(m, [])
+
+
+def test_ovms_skips_the_numa_check(monkeypatch):
+    monkeypatch.setattr(policy, "_schedulable_nodes", lambda m: [_numa_node()])
+    m = Model(name="m", namespace="n", memory="2000Gi", runtime="openvino")
+    s = Sizing(weights_gib=600, kv_gib=16, tp=1, max_model_len=8192, needed_gib=620, memory_gi=0)
+    policy.memory_gate(m, s)  # 620 GiB in a 252 GiB NUMA node: vLLM's rule, not checked for OVMS
 
 
 def test_hf_openvino_bytes_counts_the_repo_root_ir_weights(monkeypatch):

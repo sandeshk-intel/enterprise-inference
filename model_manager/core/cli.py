@@ -16,8 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import __version__, k8s, platform, renderer, routing, sizer
-from .config import (MM_DIR, Catalog, Model, Sizing, hf_config, hf_weight_bytes, hub_unreachable, is_uint, mm_path,
-                     pick, resolve, resolve_autoscaling, text, truthy)
+from .config import (MM_DIR, Catalog, Model, Sizing, hf_config, hf_openvino_bytes, hf_weight_bytes, hub_unreachable,
+                     is_uint, mm_path, pick, resolve, resolve_autoscaling, text, truthy)
 from .download import download_weights
 from .policy import (ANN, GpuRuntime, mem_bytes, memory_gate, preflight_gate, resolve_auto_cpu, resolve_policy,
                      whole_cpus)
@@ -383,9 +383,11 @@ def _apply_sizing(m: Model, catalog: Catalog, o: Options, cli_args: list[str], t
     cannot. Otherwise the set memory and KV stay, and only their fit is checked (memory_gate) when the weight size
     is known. --hfid's implicit memory: auto (m.memory_auto_default) falls back to that instead of aborting, with a
     warning. None when nothing can be checked."""
+    if m.ovms_on_cpu and m.category in SIZED_CATEGORIES:
+        return _apply_ovms_sizing(m, catalog, o)
     if not (m.vllm_on_cpu and m.category in SIZED_CATEGORIES):
         if m.memory_auto:
-            abort(f"memory: auto sizes vLLM llm and vlm models on CPU only; set memory for {m.name}.")
+            abort(f"memory: auto sizes vLLM and OpenVINO llm and vlm models on CPU only; set memory for {m.name}.")
         return None
     kv = renderer.explicit_kv_cache(m, cli_args, o.env)
     if kv and not is_uint(kv):
@@ -411,13 +413,7 @@ def _apply_sizing(m: Model, catalog: Catalog, o: Options, cli_args: list[str], t
         try:
             s = sizer.size(cfg, weights, args, tp, draft, int(m.kv_streams or 0), m.sizing_k)
         except (sizer.Unsupported, ValueError) as e:  # ValueError: a non-integer engine arg such as --max-num-seqs
-            reason = f"Hugging Face is unreachable (proxy: {proxy or 'none'})" if hub_unreachable(proxy) else e
-            if not m.memory_auto_default:
-                abort(f"memory: auto cannot size {m.name}: {reason}. Set HF_TOKEN for a gated repo, or set memory "
-                      "(and VLLM_CPU_KVCACHE_SPACE) for it.")
-            warn(f"Memory: cannot size {m.name}: {reason}; using the {m.category} default {m.memory}. Set --memory "
-                 "to choose it.")
-            m.memory_auto = False
+            _unsizable(m, e, proxy, "(and VLLM_CPU_KVCACHE_SPACE) ")
     if not s:
         draft_cfg = hf_config(m.draft_model_id, proxy) if m.draft_model_id else None
         context = sizer.served_context(cfg, args)
@@ -430,17 +426,60 @@ def _apply_sizing(m: Model, catalog: Catalog, o: Options, cli_args: list[str], t
     if not sizer.arg_value(args, "--max-model-len"):
         m.max_model_len = str(s.max_model_len)
     m.sizing = {SIZING_INPUTS: inputs, **({SIZED_CONTEXT: m.max_model_len} if m.max_model_len else {})}
+    _log_sizing(m, s)
+    return s
+
+
+def _apply_ovms_sizing(m: Model, catalog: Catalog, o: Options) -> Sizing | None:
+    """memory: auto for OVMS: the pod's memory and the cache_size the download job writes to graph.pbtxt (ovms
+    --configure), recorded as an annotation. Without memory: auto, OVMS keeps --pull's dynamic cache (cache_size 0)
+    and its memory is not checked: that cache has no fixed size."""
+    if not m.memory_auto:
+        return None
+    if text(pick(m.cat, "weight_format")):
+        abort(f"memory: auto cannot size {m.name}: ovms --pull converts it (weight_format), so its OpenVINO weight "
+              "size isn't known before the download. Set memory for it.")
+    proxy = catalog.https_proxy
+    _check_kv_streams(m, [])
+    inputs = _sizing_inputs(m, [], 1)
+    if o.memory != "auto" and _keep_live_sizing(m, inputs):
+        return None
+    try:
+        s = sizer.size_ovms(hf_config(m.model_id, proxy), hf_openvino_bytes(m.model_id, proxy),
+                            int(m.kv_streams or 0), m.sizing_k)
+    except sizer.Unsupported as e:
+        return _unsizable(m, e, proxy, "")
+    m.memory, m.kv_cache_gb = f"{s.memory_gi}Gi", str(s.kv_gib)
+    # OVMS takes no --max-model-len: it enforces the model's own context, recorded for reference.
+    m.sizing = {SIZING_INPUTS: inputs, SIZED_CONTEXT: str(s.max_model_len), SIZED_CACHE: m.kv_cache_gb}
+    _log_sizing(m, s)
+    return s
+
+
+def _unsizable(m: Model, reason, proxy: str, kv_hint: str) -> None:
+    """memory: auto that cannot size m aborts; --hfid's implicit memory: auto warns and keeps the category memory."""
+    reason = f"Hugging Face is unreachable (proxy: {proxy or 'none'})" if hub_unreachable(proxy) else reason
+    if not m.memory_auto_default:
+        abort(f"memory: auto cannot size {m.name}: {reason}. Set HF_TOKEN for a gated repo, or set memory "
+              f"{kv_hint}for it.")
+    warn(f"Memory: cannot size {m.name}: {reason}; using the {m.category} default {m.memory}. Set --memory "
+         "to choose it.")
+    m.memory_auto = False
+
+
+def _log_sizing(m: Model, s: Sizing) -> None:
     k = s.k
     overhead = s.tp * k.overhead_gib
     headroom = (s.weights_gib + s.load_gib + overhead) * (k.headroom - 1)
     parts = " + ".join(f"{gib:.1f} {name}" for name, gib in s.load_parts.items())
     load = f"{_load_text(s.load_gib)} ({parts})" if parts else ""
+    kv = f"cache_size {s.kv_gib}" if m.ovms_on_cpu else f"{s.tp * s.kv_gib} ({s.tp} x {s.kv_gib})"
+    overrides = k.overrides(m.runtime)
     info(f"  Memory: {m.memory} (auto) = weights {s.weights_gib:.1f}{load}"
          f" + overhead {overhead:g} ({s.tp} x {k.overhead_gib:g}) + headroom {headroom:.1f}"
-         f" ({(k.headroom - 1) * 100:g}%) + KV {s.tp * s.kv_gib} ({s.tp} x {s.kv_gib})"
+         f" ({(k.headroom - 1) * 100:g}%) + KV {kv}"
          f" + margin {k.margin_gib:g} GiB | KV for up to {s.streams} x {s.max_model_len} tokens"
-         f"{f' | runtimes.{m.runtime}.sizing: {_kv_text(k.overrides())}' if k.overrides() else ''}")
-    return s
+         f"{f' | runtimes.{m.runtime}.sizing: {_kv_text(overrides)}' if overrides else ''}")
 
 
 def _check_kv_streams(m: Model, args: list[str]) -> None:
@@ -458,12 +497,13 @@ def _check_kv_streams(m: Model, args: list[str]) -> None:
 
 SIZING_INPUTS = "memory-sizing.model-manager.io/inputs"
 SIZED_CONTEXT = "memory-sizing.model-manager.io/max-model-len"
+SIZED_CACHE = "memory-sizing.model-manager.io/cache-size"  # OVMS: the graph.pbtxt cache_size, in GiB
 
 
 def _sizing_inputs(m: Model, args: list[str], tp: int) -> str:
     """What memory: auto sized from: the model, its draft, the image, TP, the effective engine args, and kv_streams
     and the runtime's sizing overrides (each only when set, so deploys sized before they existed keep their hash)."""
-    overrides = m.sizing_k.overrides()
+    overrides = m.sizing_k.overrides(m.runtime)
     key = json.dumps([m.model_id, m.draft_model_id, m.image, tp, args, *([m.kv_streams] if m.kv_streams else []),
                       *([overrides] if overrides else [])], separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(key.encode()).hexdigest()[:16]
@@ -477,13 +517,16 @@ def _keep_live_sizing(m: Model, inputs: str) -> bool:
     annotations = pick(pick(live, "metadata", {}), "annotations", {})
     main = (pick(pick(pick(live, "spec", {}), "template", {}), "containers", []) or [{}])[0]
     memory = text(pick(pick(pick(main, "resources", {}), "limits", {}), "memory"))
-    kv = next((text(e.get("value")) for e in pick(main, "env", []) if e.get("name") == renderer.KV_CACHE_ENV), "")
+    kv = (text(pick(annotations, SIZED_CACHE)) if m.ovms_on_cpu else
+          next((text(e.get("value")) for e in pick(main, "env", []) if e.get("name") == renderer.KV_CACHE_ENV), ""))
     if pick(annotations, SIZING_INPUTS) != inputs or not (memory and is_uint(kv)):
         return False
     m.memory, m.kv_cache_gb = memory, kv
-    m.max_model_len = text(pick(annotations, SIZED_CONTEXT))
-    m.sizing = {k: text(v) for k, v in annotations.items() if k in (SIZING_INPUTS, SIZED_CONTEXT)}
-    info(f"  Memory: {memory} (auto, as deployed) | KV {kv} GiB per worker; --memory auto re-sizes it")
+    if not m.ovms_on_cpu:  # OVMS takes no --max-model-len
+        m.max_model_len = text(pick(annotations, SIZED_CONTEXT))
+    m.sizing = {k: text(v) for k, v in annotations.items() if k in (SIZING_INPUTS, SIZED_CONTEXT, SIZED_CACHE)}
+    kv_text = f"cache_size {kv} GiB" if m.ovms_on_cpu else f"KV {kv} GiB per worker"
+    info(f"  Memory: {memory} (auto, as deployed) | {kv_text}; --memory auto re-sizes it")
     return True
 
 
