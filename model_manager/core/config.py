@@ -269,6 +269,7 @@ class KvOffload:
     client_ip: str = ""                       # the GPU node's RDMA NIC IP
     port: str = ""                            # IAXL_RDMA_DAEMON_PORT
     pool_cpu: str = ""                        # daemon vCPUs
+    overhead_gb: int = 0                      # daemon memory per rank beside its pools
     pool_memory_gi: int = 0                   # daemon memory: (pool + scratch + overhead) x TP
 
     @property

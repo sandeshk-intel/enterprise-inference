@@ -61,6 +61,10 @@ spec:
           value: "0"
         - name: HOME
           value: "/tmp"
+        - name: IAXL_API_CONTROLLER_PORT
+          value: "5571"
+        - name: IAXL_API_WORKER_BASE_PORT
+          value: "5572"
         - name: IAXL_CACHE_DIR
           value: "/tmp/kvshrink"
         - name: IAXL_CPU_ZIP_ENABLE
@@ -176,7 +180,10 @@ metadata:
   labels:
     app.kubernetes.io/name: nemotron-mini-4b-kvshrink-rdma-kv-pool
     app.kubernetes.io/part-of: nemotron-mini-4b-kvshrink-rdma
+    app.kubernetes.io/component: kv-pool
     app.kubernetes.io/managed-by: model-manager
+  annotations:
+    model-manager/kv-pool: "{\"client_node\": \"gpu-node-1\", \"pool_node\": \"pool-node-1\", \"port\": 5555}"
 spec:
   replicas: 1
   strategy:
@@ -228,6 +235,10 @@ spec:
               value: "0"
             - name: HOME
               value: "/tmp"
+            - name: IAXL_API_CONTROLLER_PORT
+              value: "5571"
+            - name: IAXL_API_WORKER_BASE_PORT
+              value: "5572"
             - name: IAXL_CACHE_DIR
               value: "/tmp/kvshrink"
             - name: IAXL_CPU_ZIP_ENABLE

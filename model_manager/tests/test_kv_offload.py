@@ -185,30 +185,103 @@ def test_kv_offload_on_another_runtime_aborts(monkeypatch, capsys):
     assert "needs a KV-offload runtime" in capsys.readouterr().err
 
 
-def _nodes(monkeypatch, nodes: dict, enforce: str = ""):
+POOL_NODE = {"rdma/hca": "63", "qat.intel.com/dc": "128", "iaa.intel.com/wq-user-shared": "8", "memory": "1000Gi",
+             "cpu": "64"}
+
+
+def _pod(node: str, name: str, **requests) -> dict:
+    return {"metadata": {"labels": {"app.kubernetes.io/name": name}},
+            "spec": {"nodeName": node, "containers": [{"resources": {"requests": requests}}]}}
+
+
+def _pool(name: str, client_node: str, pool_node: str, port: int) -> dict:
+    return {"metadata": {"name": name, "namespace": "llm-inference", "annotations": {
+        "model-manager/kv-pool": json.dumps({"client_node": client_node, "pool_node": pool_node, "port": port})}}}
+
+
+def _cluster(monkeypatch, nodes: dict, pods=(), pools=(), enforce: str = ""):
+    """A fake cluster for the pre-flight: nodes' allocatable, running pods, other models' pool Deployments."""
     def get_json(kind, name=None, *rest):
         if kind == "namespace":
             return {"metadata": {"labels": {"pod-security.kubernetes.io/enforce": enforce} if enforce else {}}}
+        if kind == "pods":
+            node = rest[-1].split(",")[0].split("=")[1]
+            return {"items": [p for p in pods if p["spec"]["nodeName"] == node]}
+        if kind == "deployments":
+            return {"items": list(pools)}
         return {"status": {"allocatable": nodes[name]}} if name in nodes else None
     monkeypatch.setattr(k8s, "get_json", get_json)
 
 
-def test_preflight_passes_when_the_nodes_have_the_devices_and_memory(monkeypatch, tmp_path):
+def _errors(monkeypatch, tmp_path, **cluster) -> str:
     m, _, _ = _deploy(monkeypatch, tmp_path, RDMA)
-    _nodes(monkeypatch, {"gpu-node-1": {"rdma/hca": "63"},
-                         "pool-node-1": {"rdma/hca": "63", "qat.intel.com/dc": "128", "iaa.intel.com/wq-user-shared": "8",
-                                         "memory": "1000Gi"}})
-    assert kv_offload.preflight(m, 1) == []
+    _cluster(monkeypatch, **{"nodes": {"gpu-node-1": {"rdma/hca": "63"}, "pool-node-1": POOL_NODE}, **cluster})
+    return "\n".join(kv_offload.preflight(m, 1))
 
 
-def test_preflight_reports_missing_devices_memory_and_a_forbidding_namespace(monkeypatch, tmp_path):
-    m, _, _ = _deploy(monkeypatch, tmp_path, RDMA)
-    _nodes(monkeypatch, {"pool-node-1": {"rdma/hca": "63", "qat.intel.com/dc": "4", "memory": "256Gi"}},
-           enforce="restricted")
-    errors = "\n".join(kv_offload.preflight(m, 1))
+def test_preflight_passes_when_the_nodes_have_the_devices_and_memory_free(monkeypatch, tmp_path):
+    assert _errors(monkeypatch, tmp_path) == ""
+
+
+def test_preflight_counts_the_memory_other_pods_request_and_names_the_pool_that_fits(monkeypatch, tmp_path):
+    errors = _errors(monkeypatch, tmp_path, pods=[_pod("pool-node-1", "other", memory="700Gi")])
+    assert ("Node pool-node-1 has 300Gi memory free (1000Gi allocatable, 700Gi requested by its other pods); the KV "
+            "pool needs 440Gi = (pool_gb 400 + scratch 8 + overhead 32) x TP 1. Lower pool_gb to 260 or less.") in errors
+
+
+def test_preflight_does_not_count_the_pool_daemon_it_replaces(monkeypatch, tmp_path):
+    own = _pod("pool-node-1", f"{RDMA}-kv-pool", memory="440Gi", cpu="16", **{"qat.intel.com/dc": "8"})
+    assert _errors(monkeypatch, tmp_path, pods=[own, own]) == ""
+
+
+def test_preflight_reports_devices_and_cpu_other_pods_hold(monkeypatch, tmp_path):
+    errors = _errors(monkeypatch, tmp_path, pods=[_pod("pool-node-1", "other", cpu="60", **{"qat.intel.com/dc": "124"})])
+    assert "Node pool-node-1 has 4 qat.intel.com/dc free of 128; the KV pool needs 8." in errors
+    assert "Node pool-node-1 has 4 CPU free of 64; the KV pool needs 16." in errors
+
+
+def test_preflight_reports_missing_nodes_devices_and_a_forbidding_namespace(monkeypatch, tmp_path):
+    errors = _errors(monkeypatch, tmp_path, nodes={"pool-node-1": {"memory": "1000Gi", "cpu": "64"}},
+                     enforce="restricted")
     assert "enforces Pod Security 'restricted'" in errors and "Node gpu-node-1 was not found" in errors
-    assert "4 allocatable qat.intel.com/dc; the KV pool needs 8" in errors
-    assert "0 allocatable iaa.intel.com/wq-user-shared" in errors and "256Gi allocatable memory; the KV pool needs 440Gi" in errors
+    assert "has 0 iaa.intel.com/wq-user-shared free of 0; the KV pool needs 8." in errors
+
+
+def test_preflight_refuses_a_second_remote_pool_model_on_the_same_gpu_node(monkeypatch, tmp_path):
+    errors = _errors(monkeypatch, tmp_path, pools=[_pool("model-a-kv-pool", "gpu-node-1", "pool-node-2", 6000)])
+    assert "llm-inference/model-a-kv-pool's model already runs vLLM on gpu-node-1's host network, on port 8000" in errors
+
+
+def test_preflight_refuses_overlapping_ports_on_a_shared_pool_node_and_suggests_a_free_one(monkeypatch, tmp_path):
+    errors = _errors(monkeypatch, tmp_path, pools=[_pool("model-a-kv-pool", "gpu-node-2", "pool-node-1", 5555)])
+    assert "Host ports 5555-5586 collide with llm-inference/model-a-kv-pool's" in errors
+    assert "Set kv_offload.remote.port to 5587." in errors
+
+
+def test_preflight_allows_two_pools_on_one_node_with_separate_ports(monkeypatch, tmp_path):
+    assert _errors(monkeypatch, tmp_path, pools=[_pool("model-a-kv-pool", "gpu-node-2", "pool-node-1", 5587)]) == ""
+
+
+def test_preflight_ignores_its_own_pool_daemon(monkeypatch, tmp_path):
+    assert _errors(monkeypatch, tmp_path, pools=[_pool(f"{RDMA}-kv-pool", "gpu-node-1", "pool-node-1", 5555)]) == ""
+
+
+@pytest.mark.parametrize("port", [80, 7990, 65530])
+def test_the_port_block_must_be_unprivileged_in_range_and_clear_of_vllm(monkeypatch, tmp_path, capsys, port):
+    with pytest.raises(SystemExit):
+        _deploy(monkeypatch, tmp_path, RDMA, remote={"node": "pool-node-1", "ip": "192.0.2.13",
+                                                     "client_ip": "192.0.2.14", "port": port})
+    assert "must leave out vLLM's 8000" in capsys.readouterr().err
+
+
+def test_iaxl_api_ports_follow_the_port_on_both_pods(monkeypatch, tmp_path):
+    _, doc, pool = _deploy(monkeypatch, tmp_path, RDMA)
+    for c in (doc["spec"]["template"]["containers"][0], pool["spec"]["template"]["spec"]["containers"][0]):
+        env = _env(c)
+        assert (env["IAXL_API_CONTROLLER_PORT"], env["IAXL_API_WORKER_BASE_PORT"]) == ("5571", "5572")
+    assert pool["metadata"]["labels"]["app.kubernetes.io/component"] == "kv-pool"
+    assert json.loads(pool["metadata"]["annotations"]["model-manager/kv-pool"]) == \
+        {"client_node": "gpu-node-1", "pool_node": "pool-node-1", "port": 5555}
 
 
 def test_reconcile_applies_and_waits_for_the_daemon_and_a_local_pool_removes_it(monkeypatch, tmp_path):
@@ -274,7 +347,7 @@ def _entry(host: Path, cpuset: str, *args: str, **env: str) -> subprocess.Comple
     base = {"PATH": os.environ["PATH"], "KVSHRINK_CPUSET_FILE": str(host / "cpuset"),
             "KVSHRINK_NODE_DIR": str(host / "node"), "KVSHRINK_EXEC": str(host / "fake-vllm"),
             "KVSHRINK_SYSFS": str(host / "sys"), "KVSHRINK_NET_ADDR_FILE": str(host / "addr.json")}
-    return subprocess.run(["bash", str(ENTRYPOINT), *args], env={**base, **env},  # nosec B603 B607: test fixture
+    return subprocess.run(["bash", str(ENTRYPOINT), *args], env={**base, **env},  # nosec B603 B607: bash from PATH, in a test
                           capture_output=True, text=True, check=False)
 
 

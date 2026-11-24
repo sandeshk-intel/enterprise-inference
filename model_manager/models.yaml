@@ -610,7 +610,7 @@ models:
     autodeploy: false
 
   # The same with the pool on a second node over RDMA (RoCE), compressed there with Intel QAT and IAA.
-  # Set node, the pool node and both NIC IPs to yours (rdma_shared_dev_plugin, intel_accel_plugins).
+  # Set node, the pool node and both NIC IPs to yours (the accel_device_plugins platform component).
   - name: nemotron-mini-4b-kvshrink-rdma
     model_id: nvidia/Nemotron-Mini-4B-Instruct
     category: llm

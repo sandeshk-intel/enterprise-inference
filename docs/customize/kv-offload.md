@@ -19,7 +19,7 @@ memory, and in remote mode creates, waits for and removes the `<model>-kv-pool` 
 |---|---|---|
 | GPU node | NVIDIA GPU, `nvidia.com/gpu` advertised | the same, plus an RDMA NIC |
 | Pool node | — | RDMA NIC that routes to the GPU node's; for QAT/IAA, Intel QAT (in-tree `qat_4xxx`, Linux 6.0+) and IAA with PASID enabled |
-| Platform components | — | `rdma_shared_dev_plugin` on both nodes (`rdma/hca`); `intel_accel_plugins` on the pool node for QAT/IAA (`qat.intel.com/dc`, `iaa.intel.com/wq-user-shared`) — see the solutions repo's `docs/deploy/install_platform.md` |
+| Platform components | — | `accel_device_plugins` with `rdma` on both nodes (`rdma/hca`) and, for QAT/IAA, `qat`/`iaa` on the pool node (`qat.intel.com/dc`, `iaa.intel.com/wq-user-shared`) — see the solutions repo's `docs/deploy/install_platform.md` |
 | Namespace | any | no `baseline`/`restricted` Pod Security enforcement: both pods run on the host network, because UCX binds the NIC that owns the RDMA IP. With `enforce_pss: true`, deploy the model to another namespace |
 | Container runtime | memlock unlimited (kubespray's default `containerd_limit_mem_lock: infinity`) | the same; for QAT/IAA, `device_ownership_from_security_context: true` (kubespray `containerd_extra_runtime_args`) so the non-root daemon can open the VFs and work queues |
 
@@ -73,7 +73,7 @@ IAXL and vLLM must be a matched pair: IAXL main `556c832` (the Dockerfile's `KVS
 | `zip_threads` | QAT/IAA: vCPUs − 4 | `IAXL_OMP_THREAD_NUM`, threads driving the compressors |
 | `cpu_zip_threads` | 4 (IAXL's) | `IAXL_CPU_ZIP_THREADS`, zlib workers with `compression: cpu` |
 | `remote.node`, `remote.ip`, `remote.client_ip` | — | remote mode: the pool node, its RDMA NIC IP, and the GPU node's RDMA NIC IP that routes to it |
-| `remote.port` | 5555 | `IAXL_RDMA_DAEMON_PORT` |
+| `remote.port` | 5555 | first of the 32 host ports the model takes on both nodes: the RDMA daemon's (`IAXL_RDMA_DAEMON_PORT`, then one per rank) and, from `port + 16`, IAXL's API (`IAXL_API_CONTROLLER_PORT`, `IAXL_API_WORKER_BASE_PORT`). Give models that share a pool node separate blocks |
 | `remote.cpu` | 16 × TP | daemon vCPUs |
 | `daemon_overhead_gb` | 32 | daemon memory per rank beside its pools |
 
@@ -88,8 +88,13 @@ Deploy as any model: `./model-manager deploy nemotron-mini-4b-kvshrink --wait`. 
 - **Local:** the pod requests `memory + (pool_gb + scratch_gb) × TP`; `memory` is vLLM's own (category default
   64Gi). The CPU/memory pre-flight checks that a node has it free.
 - **Remote:** the vLLM pod requests only `memory`; the daemon requests `(pool_gb + scratch_gb + daemon_overhead_gb) ×
-  TP` and `remote.cpu`. The pre-flight checks the pool node's allocatable memory, and that both nodes advertise
-  `rdma/hca` and the pool node the QAT VFs and IAA work queues.
+  TP` and `remote.cpu`, reserved whether or not the pool has filled (IAXL grows the pool up to `pool_gb` and evicts
+  from there). The pre-flight checks what is **free** on the pool node once its other pods' requests are counted
+  (not the daemon it replaces): memory, CPU, `rdma/hca` and the QAT VFs and IAA work queues, and `rdma/hca` on the GPU
+  node. A memory shortfall names the largest `pool_gb` that fits.
+- **Host ports:** the pre-flight reads the other remote-pool models' daemons (`app.kubernetes.io/component=kv-pool`)
+  and refuses a second one on the same GPU node, or a port block that collides with another on a shared node, naming
+  a free `remote.port`.
 
 Leave the OS and other pods their share: on a 512 GiB node, a 256–400 GiB pool is typical.
 
@@ -109,8 +114,10 @@ Compression buys pool capacity, not bandwidth; QAT/IAA are faster than storing r
 
 ## Known limits
 
-- One remote-pool model per GPU node and per pool node: on the host network, vLLM's port 8000 and IAXL's fixed
-  management ports (18700, 18800+) collide.
+- One remote-pool model per GPU node: KServe serves every `LLMInferenceService` on port 8000 and does not support
+  another, and on the host network that port is the node's. Several models can share a pool node, each with its own
+  `remote.port` block and its own daemon and pool (pools are not shared between models).
+- A remote-pool model runs one replica: its vLLM pod is pinned to the node that owns `client_ip`.
 - The pods take the node's whole cpuset share and pin OMP threads inside it (the image's entrypoint); `--cpu`
   sets the request.
 - A burst larger than one scheduler step (`--max-num-batched-tokens`) offloaded only that step's requests with
@@ -124,7 +131,7 @@ Compression buys pool capacity, not bandwidth; QAT/IAA are faster than storing r
 |---|---|
 | `Runtime 'vllm-cuda-kvshrink' version '0.29.0' defines no image` | build and push the image, and set it (above) |
 | `KV offload pre-flight: ... enforces Pod Security` | remote mode: use a namespace without `baseline`/`restricted` enforcement |
-| Pool daemon `Pending` on `rdma/hca`, `qat.intel.com/dc` or `iaa.intel.com/wq-user-shared` | install `rdma_shared_dev_plugin` / `intel_accel_plugins` for that node |
+| Pool daemon `Pending` on `rdma/hca`, `qat.intel.com/dc` or `iaa.intel.com/wq-user-shared` | list that node under `accel_device_plugins_nodes` (`rdma`, `qat`, `iaa`) and re-run `install accel_device_plugins` |
 | Daemon log `qat_zip: failed to start QAT user space` | the pod got no usable VF: check its `qat.intel.com/dc` request and `device_ownership_from_security_context` |
 | vLLM log `UCX ERROR ... no route to <ip>` | the entrypoint logs the `UCX_IB_GID_INDEX` it chose for the RDMA IP; check `client_ip`/`ip` are on the RDMA NICs |
 | First requests take seconds (`CuTeDSL JIT compilation`) | vLLM 0.29 compiles kernels per batch shape; warm up before measuring |

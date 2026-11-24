@@ -277,8 +277,9 @@
         - apiGroups: [""]
           resources: [nodes, pods, namespaces, services, persistentvolumes]
           verbs: [get, list]
+        # deployments: the KV pool daemons, whose host ports the KV-offload pre-flight checks.
         - apiGroups: [apps]
-          resources: [daemonsets]
+          resources: [daemonsets, deployments]
           verbs: [get, list]
         - apiGroups: [""]
           resources: [configmaps]

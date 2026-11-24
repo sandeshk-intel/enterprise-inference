@@ -6,7 +6,10 @@ metadata:
   labels:
     app.kubernetes.io/name: {{NAME}}
     app.kubernetes.io/part-of: {{MODEL_NAME}}
+    app.kubernetes.io/component: kv-pool
     app.kubernetes.io/managed-by: model-manager
+  annotations:
+    model-manager/kv-pool: {{FOOTPRINT}}
 spec:
   replicas: 1
   strategy:
