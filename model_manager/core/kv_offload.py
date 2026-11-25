@@ -7,7 +7,7 @@ import json
 import math
 
 from . import k8s
-from .config import KvOffload, Model, is_uint, pick, text
+from .config import DNS_LABEL, KvOffload, Model, is_uint, pick, text
 from .policy import _cpu_millis, gate, mem_bytes, pod_requests
 from .renderer import _list, quote, render, resource_lines, template
 from .ui import abort, info, warn
@@ -22,6 +22,8 @@ PORT_BLOCK, API_OFFSET = 32, 16
 # is one remote-pool model per GPU node.
 VLLM_PORT = 8000
 ANNOTATION = "model-manager/kv-pool"
+MULTUS = "k8s.v1.cni.cncf.io/networks"
+RDMA_IFACE = "rdma0"          # the SR-IOV VF's name in the vLLM pod
 
 
 def pool_name(m: Model) -> str:
@@ -43,6 +45,30 @@ def _ipv4(remote: dict, key: str, m: Model) -> str:
         abort(f"Model '{m.name}': kv_offload.remote.{key} must be the IPv4 address of an RDMA NIC, got: "
               f"{value or 'nothing'}")
     return value
+
+
+def _network(remote: dict, kv: KvOffload, m: Model) -> None:
+    """kv_offload.remote.network: the vLLM pod leaves the host network and reaches the pool through an SR-IOV VF of
+    the RDMA NIC, attached by Multus with a static address (client_ip, with its prefix)."""
+    namespace, _, name = text(remote["network"]).rpartition("/")
+    namespace = namespace or m.namespace
+    if not (DNS_LABEL.fullmatch(namespace) and DNS_LABEL.fullmatch(name)):
+        abort(f"Model '{m.name}': kv_offload.remote.network must name a NetworkAttachmentDefinition, as "
+              f"<namespace>/<name> or <name>, got: {remote['network']}")
+    kv.network = f"{namespace}/{name}"
+    kv.network_resource = text(pick(remote, "network_resource"))
+    if "/" not in kv.network_resource:
+        abort(f"Model '{m.name}': kv_offload.remote.network_resource must be the extended resource the network's SR-IOV "
+              f"VFs are advertised as (e.g. nvidia.com/rdma_vf), got: {kv.network_resource or 'nothing'}")
+    value = text(pick(remote, "client_ip"))
+    try:
+        address = ipaddress.IPv4Interface(value) if "/" in value else None
+    except ValueError:
+        address = None
+    if not address:
+        abort(f"Model '{m.name}': with kv_offload.remote.network, client_ip is the vLLM pod's own address on it, with "
+              f"its prefix (e.g. 10.201.1.21/24), got: {value or 'nothing'}")
+    kv.client_cidr, kv.client_ip = value, str(address.ip)
 
 
 def resolve(m: Model, tp: int) -> KvOffload | None:
@@ -74,11 +100,16 @@ def resolve(m: Model, tp: int) -> KvOffload | None:
     if not isinstance(remote, dict) or not text(pick(remote, "node")):
         abort(f"Model '{m.name}': kv_offload.remote needs node: (the node that runs the pool daemon), ip: and client_ip:.")
     kv.pool_node = text(remote["node"])
-    if not m.node:
-        abort(f"Model '{m.name}': a remote KV pool needs node: (the GPU node whose NIC owns kv_offload.remote.client_ip).")
     if len(pool_name(m)) > 63:
         abort(f"Model '{m.name}': the name is too long for its pool daemon '{pool_name(m)}' (63 characters at most).")
-    kv.pool_ip, kv.client_ip = _ipv4(remote, "ip", m), _ipv4(remote, "client_ip", m)
+    kv.pool_ip = _ipv4(remote, "ip", m)
+    if pick(remote, "network"):
+        _network(remote, kv, m)
+    elif not m.node:
+        abort(f"Model '{m.name}': a remote KV pool on the host network needs node: (the GPU node whose NIC owns "
+              "kv_offload.remote.client_ip), or set kv_offload.remote.network.")
+    else:
+        kv.client_ip = _ipv4(remote, "client_ip", m)
     kv.port = str(_uint(remote, "port", m, pick(c, "rdma_port"), "kv_offload.remote"))
     if not 1024 <= int(kv.port) <= 65536 - PORT_BLOCK or VLLM_PORT in range(int(kv.port), int(kv.port) + PORT_BLOCK):
         abort(f"Model '{m.name}': kv_offload.remote.port must be between 1024 and {65536 - PORT_BLOCK}, and the "
@@ -127,15 +158,22 @@ def _pool_env(kv: KvOffload, cpus: int) -> dict:
 
 def apply(m: Model, kv: KvOffload, tp: int) -> None:
     """The vLLM pod's side. Local: the pool in its env, memory and devices. Remote: an RDMA client of the pool daemon,
-    on the host network because UCX binds the NIC that owns client_ip."""
+    on an SR-IOV VF of its own (network), or on the host network: UCX binds the NIC that owns client_ip."""
     if kv.remote:
         env = {"IAXL_RDMA_ENABLE": "1", "IAXL_RDMA_DAEMON_NIC_IPS": kv.pool_ip, "IAXL_RDMA_CLIENT_NIC_IPS": kv.client_ip,
                "KVSHRINK_RDMA_LOCAL_IP": kv.client_ip, "IAXL_RDMA_DAEMON_PORT": kv.port, "IAXL_RDMA_TP_SIZE": str(tp),
                **_api_env(kv)}
-        m.extra_resources = {text(kv.resources["rdma"]): "1"}
-        m.host_network = True
+        if kv.network:
+            namespace, name = kv.network.split("/")
+            m.pod_annotations = {MULTUS: json.dumps([{"name": name, "namespace": namespace, "interface": RDMA_IFACE,
+                                                      "ips": [kv.client_cidr]}])}
+            m.extra_resources = {kv.network_resource: "1"}
+        else:
+            m.extra_resources = {text(kv.resources["rdma"]): "1"}
+            m.host_network = True
+        via = f"network {kv.network} as {kv.client_cidr}" if kv.network else "the host network"
         info(f"  KV offload: {kv.pool_gb} GiB x {tp} rank(s) on {kv.pool_node} ({kv.pool_ip}:{kv.port}) over RDMA, "
-             f"compression {kv.compression}")
+             f"through {via}; compression {kv.compression}")
     else:
         env = _pool_env(kv, int(m.cpu) if is_uint(m.cpu) else 0)
         m.extra_resources = _accelerators(kv, tp)
@@ -158,7 +196,8 @@ def pool_manifest(m: Model, tp: int) -> str:
                   ENV=_list([f"            - name: {k}\n              value: {quote(text(v))}" for k, v in sorted(env.items())]),
                   RESOURCES=resource_lines({text(kv.resources["rdma"]): "1", **_accelerators(kv, tp)}, 14),
                   RUN_AS=m.run_as_user,
-                  FOOTPRINT=quote(json.dumps({"client_node": m.node, "pool_node": kv.pool_node, "port": int(kv.port)})))
+                  FOOTPRINT=quote(json.dumps({"client_node": m.node, "pool_node": kv.pool_node, "port": int(kv.port),
+                                              "network": bool(kv.network), "client_ip": kv.client_ip})))
 
 
 def _quantity(key: str, value: object) -> int:
@@ -216,14 +255,16 @@ def _short(node: str, needs: dict, owner: str, kv: KvOffload | None = None, tp: 
     return errors
 
 
-def _footprint(client_node: str, pool_node: str, port: int) -> dict:
-    """Host ports a remote-pool model holds, per node: its port block on both, and vLLM's on the GPU node."""
-    block = set(range(port, port + PORT_BLOCK))
-    return {pool_node: set(block), client_node: block | {VLLM_PORT}}
+def _footprint(fp: dict) -> dict:
+    """Host ports a remote-pool model holds, per node: its port block on the pool node and, on the host network, on
+    its GPU node too, with vLLM's."""
+    block = set(range(int(fp["port"]), int(fp["port"]) + PORT_BLOCK))
+    return {fp["pool_node"]: block, **({} if fp["network"] else {fp["client_node"]: block | {VLLM_PORT}})}
 
 
 def _port_conflicts(m: Model) -> list[str]:
-    """Other remote-pool models whose host ports collide with this one's on a node they share."""
+    """Other remote-pool models whose host ports collide with this one's on a node they share, or that hold its
+    address on the RDMA network."""
     pools = k8s.get_json("deployments", "-A", "-l", "app.kubernetes.io/component=kv-pool")
     if pools is None:
         warn("Could not list the KV pool daemons — skipping the host-port check.")
@@ -236,20 +277,24 @@ def _port_conflicts(m: Model) -> list[str]:
             continue
         try:
             fp = json.loads(text(pick(pick(meta, "annotations", {}), ANNOTATION)))
-            others.append((f"{pick(meta, 'namespace')}/{pick(meta, 'name')}", fp["client_node"],
-                           _footprint(fp["client_node"], fp["pool_node"], int(fp["port"]))))
+            fp.setdefault("network", False)
+            others.append((f"{pick(meta, 'namespace')}/{pick(meta, 'name')}", fp, _footprint(fp)))
         except (ValueError, KeyError, TypeError):
             continue
-    mine = _footprint(m.node, kv.pool_node, int(kv.port))
+    mine = _footprint({"client_node": m.node, "pool_node": kv.pool_node, "port": kv.port, "network": bool(kv.network)})
     taken: dict = {}
     for _, _, theirs in others:
         for node, ports in theirs.items():
             taken.setdefault(node, set()).update(ports)
     errors = []
-    for name, client_node, theirs in others:
-        if client_node == m.node:
+    for name, fp, theirs in others:
+        if kv.network and fp["network"] and fp.get("client_ip") == kv.client_ip:
+            errors.append(f"{name}'s model already uses {kv.client_ip} on the RDMA network: give client_ip another "
+                          "address.")
+        if VLLM_PORT in theirs.get(m.node, set()) & mine.get(m.node, set()):
             errors.append(f"{name}'s model already runs vLLM on {m.node}'s host network, on port {VLLM_PORT}, which "
-                          "KServe fixes: one remote-pool model per GPU node. Use another GPU node, or a local pool.")
+                          "KServe fixes: one host-network remote-pool model per GPU node. Use kv_offload.remote.network, "
+                          "another GPU node, or a local pool.")
         elif any(ports & mine.get(node, set()) for node, ports in theirs.items()):
             errors.append(f"Host ports {kv.port}-{int(kv.port) + PORT_BLOCK - 1} collide with {name}'s on a node they "
                           f"share. Set kv_offload.remote.port to {_free_port(taken, mine)}.")
@@ -266,7 +311,8 @@ def _free_port(taken: dict, mine: dict) -> int:
 
 def preflight(m: Model, tp: int) -> list[str]:
     """What would leave its pods Pending, crashing or rejected: the devices, CPU and memory free on the nodes, the
-    host ports other remote-pool models hold, and, for the host network, the namespace's Pod Security level."""
+    host ports and RDMA addresses other remote-pool models hold, the Multus network, and, for the host network of the
+    pool daemon (and of a vLLM pod without a network), the namespace's Pod Security level."""
     kv = m.kv
     accel = {k: int(v) for k, v in _accelerators(kv, tp).items()}
     if not kv.remote:
@@ -276,9 +322,16 @@ def preflight(m: Model, tp: int) -> list[str]:
     errors = [f"Namespace {m.namespace} enforces Pod Security '{level}', which rejects the host network the RDMA pool "
               "needs: deploy the model to a namespace without it."] if level in HOST_NETWORK_FORBIDDEN else []
     rdma = text(kv.resources["rdma"])
+    if kv.network:
+        namespace, name = kv.network.split("/")
+        if k8s.get_json("network-attachment-definitions.k8s.cni.cncf.io", name, "-n", namespace) is None:
+            errors.append(f"Network {kv.network} was not found: no such NetworkAttachmentDefinition, or Multus is "
+                          "not installed.")
+        client = _short(m.node, {kv.network_resource: 1}, m.name) if m.node else []
+    else:
+        client = _short(m.node, {rdma: 1}, m.name)
     pool_needs = {rdma: 1, **accel, "cpu": int(kv.pool_cpu) * 1000, "memory": kv.pool_memory_gi * GIB}
-    return (errors + _port_conflicts(m) + _short(m.node, {rdma: 1}, m.name)
-            + _short(kv.pool_node, pool_needs, pool_name(m), kv, tp))
+    return errors + _port_conflicts(m) + client + _short(kv.pool_node, pool_needs, pool_name(m), kv, tp)
 
 
 def check(m: Model, tp: int) -> None:

@@ -20,7 +20,7 @@ memory, and in remote mode creates, waits for and removes the `<model>-kv-pool` 
 | GPU node | NVIDIA GPU, `nvidia.com/gpu` advertised | the same, plus an RDMA NIC |
 | Pool node | — | RDMA NIC that routes to the GPU node's; for QAT/IAA, Intel QAT (in-tree `qat_4xxx`, Linux 6.0+) and IAA with PASID enabled |
 | Platform components | — | `accel_device_plugins` with `rdma` on both nodes (`rdma/hca`) and, for QAT/IAA, `qat`/`iaa` on the pool node (`qat.intel.com/dc`, `iaa.intel.com/wq-user-shared`) — see the solutions repo's `docs/deploy/install_platform.md` |
-| Namespace | any | no `baseline`/`restricted` Pod Security enforcement: both pods run on the host network, because UCX binds the NIC that owns the RDMA IP. With `enforce_pss: true`, deploy the model to another namespace |
+| Namespace | any | no `baseline`/`restricted` Pod Security enforcement: the pool daemon (and, without `remote.network`, the vLLM pod) runs on the host network, because UCX binds the NIC that owns the RDMA IP. With `enforce_pss: true`, deploy the model to another namespace |
 | Container runtime | memlock unlimited (kubespray's default `containerd_limit_mem_lock: infinity`) | the same; for QAT/IAA, `device_ownership_from_security_context: true` (kubespray `containerd_extra_runtime_args`) so the non-root daemon can open the VFs and work queues |
 
 RDMA itself (MLNX_OFED / DOCA-OFED, port up, RoCE v2 GIDs) is set up on the hosts beforehand.
@@ -72,13 +72,43 @@ IAXL and vLLM must be a matched pair: IAXL main `556c832` (the Dockerfile's `KVS
 | `iaa_wqs` | required with IAA | IAA shared work queues, one per IAA device: IAXL uses every device on the node |
 | `zip_threads` | QAT/IAA: vCPUs − 4 | `IAXL_OMP_THREAD_NUM`, threads driving the compressors |
 | `cpu_zip_threads` | 4 (IAXL's) | `IAXL_CPU_ZIP_THREADS`, zlib workers with `compression: cpu` |
-| `remote.node`, `remote.ip`, `remote.client_ip` | — | remote mode: the pool node, its RDMA NIC IP, and the GPU node's RDMA NIC IP that routes to it |
+| `remote.node`, `remote.ip`, `remote.client_ip` | — | remote mode: the pool node, its RDMA NIC IP, and the GPU node's RDMA NIC IP that routes to it (with `remote.network`: the vLLM pod's own address on that network, with its prefix) |
+| `remote.network`, `remote.network_resource` | — | optional: a Multus NetworkAttachmentDefinition (`<namespace>/<name>` or `<name>`) giving the vLLM pod an SR-IOV VF of the RDMA NIC, and the extended resource its VFs are advertised as (see [below](#remote-pool-over-an-sr-iov-network)) |
 | `remote.port` | 5555 | first of the 32 host ports the model takes on both nodes: the RDMA daemon's (`IAXL_RDMA_DAEMON_PORT`, then one per rank) and, from `port + 16`, IAXL's API (`IAXL_API_CONTROLLER_PORT`, `IAXL_API_WORKER_BASE_PORT`). Give models that share a pool node separate blocks |
 | `remote.cpu` | 16 × TP | daemon vCPUs |
 | `daemon_overhead_gb` | 32 | daemon memory per rank beside its pools |
 
-A remote pool also needs the model's `node:` (the GPU node that owns `client_ip`), since the vLLM pod binds that
-address. `nemotron-mini-4b-kvshrink-rdma` in `models.yaml` is a remote example to copy.
+On the host network (no `remote.network`), a remote pool also needs the model's `node:` (the GPU node that owns
+`client_ip`), since the vLLM pod binds that address. `nemotron-mini-4b-kvshrink-rdma` in `models.yaml` is a remote
+example to copy.
+
+### Remote pool over an SR-IOV network
+
+On the host network a GPU node runs one remote-pool model: KServe serves vLLM on port 8000 and does not support
+another, and on the host network that port is the node's. With `remote.network`, the vLLM pod keeps its own network
+and reaches the pool through an SR-IOV virtual function (VF) of the RDMA NIC that Multus attaches as `rdma0`, with
+`client_ip` as a static address. Several remote-pool models then share a GPU node, and the pod needs no `node:`
+(keep it when the address only routes from that node). The pool daemon stays on the pool node's host network.
+
+```yaml
+kv_offload:
+  pool_gb: 400
+  remote:
+    node: worker2
+    ip: 10.201.1.13                    # the pool node's RDMA NIC
+    network: rdma-net                  # NetworkAttachmentDefinition, in the model's namespace here
+    network_resource: nvidia.com/rdma_vf
+    client_ip: 10.201.1.21/24          # this model's own, unused address on that network
+```
+
+Prerequisites, set up outside the stack (for example with the NVIDIA Network Operator): Multus; VFs created on the
+GPU nodes' RDMA NICs and advertised by the SR-IOV network device plugin with `isRdma: true` as `network_resource`;
+and a NetworkAttachmentDefinition of type `sriov` for that resource, with `"ipam": {"type": "static"}` and
+`"capabilities": {"ips": true}`. A VF is needed, not a macvlan interface: IAXL finds its RDMA device through the
+interface's PCI device (`/sys/class/net/<if>/device/infiniband`), which macvlan does not have.
+
+The pre-flight checks that the network exists, that the pinned GPU node (if any) has a free VF, and that no other
+model holds `client_ip`.
 
 Deploy as any model: `./model-manager deploy nemotron-mini-4b-kvshrink --wait`. `--dry-run` prints the
 `LLMInferenceService` and, in remote mode, the pool daemon's Deployment.
@@ -90,11 +120,11 @@ Deploy as any model: `./model-manager deploy nemotron-mini-4b-kvshrink --wait`. 
 - **Remote:** the vLLM pod requests only `memory`; the daemon requests `(pool_gb + scratch_gb + daemon_overhead_gb) ×
   TP` and `remote.cpu`, reserved whether or not the pool has filled (IAXL grows the pool up to `pool_gb` and evicts
   from there). The pre-flight checks what is **free** on the pool node once its other pods' requests are counted
-  (not the daemon it replaces): memory, CPU, `rdma/hca` and the QAT VFs and IAA work queues, and `rdma/hca` on the GPU
-  node. A memory shortfall names the largest `pool_gb` that fits.
+  (not the daemon it replaces): memory, CPU, `rdma/hca` and the QAT VFs and IAA work queues, and on the GPU node
+  `rdma/hca` (host network) or a VF (`remote.network`). A memory shortfall names the largest `pool_gb` that fits.
 - **Host ports:** the pre-flight reads the other remote-pool models' daemons (`app.kubernetes.io/component=kv-pool`)
-  and refuses a second one on the same GPU node, or a port block that collides with another on a shared node, naming
-  a free `remote.port`.
+  and refuses a second host-network one on the same GPU node, or a port block that collides with another on a shared
+  node, naming a free `remote.port`.
 
 Leave the OS and other pods their share: on a 512 GiB node, a 256–400 GiB pool is typical.
 
@@ -114,10 +144,11 @@ Compression buys pool capacity, not bandwidth; QAT/IAA are faster than storing r
 
 ## Known limits
 
-- One remote-pool model per GPU node: KServe serves every `LLMInferenceService` on port 8000 and does not support
-  another, and on the host network that port is the node's. Several models can share a pool node, each with its own
-  `remote.port` block and its own daemon and pool (pools are not shared between models).
-- A remote-pool model runs one replica: its vLLM pod is pinned to the node that owns `client_ip`.
+- A remote-pool model runs one replica. An IAXL pool daemon serves one vLLM instance: a second client is refused
+  at registration (`kv_caches already registered`, `iaxl/remote_pool/rpc.py`), and KServe replicas cannot each get a
+  daemon of their own.
+- On the host network, one remote-pool model per GPU node (port 8000, above); `remote.network` lifts it. Several
+  models can share a pool node, each with its own `remote.port` block, daemon and pool: pools are not shared.
 - The pods take the node's whole cpuset share and pin OMP threads inside it (the image's entrypoint); `--cpu`
   sets the request.
 - A burst larger than one scheduler step (`--max-num-batched-tokens`) offloaded only that step's requests with

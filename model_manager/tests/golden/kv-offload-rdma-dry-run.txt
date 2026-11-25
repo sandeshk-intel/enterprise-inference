@@ -6,7 +6,7 @@
 [INFO ]    GPUs: 1 x nvidia.com/gpu
 [INFO ]    Node: gpu-node-1
 [INFO ]    CPU policy: n/a (GPU runtime — no CPU pinning)
-[INFO ]    KV offload: 400 GiB x 1 rank(s) on pool-node-1 (192.0.2.13:5555) over RDMA, compression qat+iaa
+[INFO ]    KV offload: 400 GiB x 1 rank(s) on pool-node-1 (192.0.2.13:5555) over RDMA, through the host network; compression qat+iaa
 apiVersion: serving.kserve.io/v1alpha2
 kind: LLMInferenceService
 metadata:
@@ -183,7 +183,7 @@ metadata:
     app.kubernetes.io/component: kv-pool
     app.kubernetes.io/managed-by: model-manager
   annotations:
-    model-manager/kv-pool: "{\"client_node\": \"gpu-node-1\", \"pool_node\": \"pool-node-1\", \"port\": 5555}"
+    model-manager/kv-pool: "{\"client_node\": \"gpu-node-1\", \"pool_node\": \"pool-node-1\", \"port\": 5555, \"network\": false, \"client_ip\": \"192.0.2.14\"}"
 spec:
   replicas: 1
   strategy:

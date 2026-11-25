@@ -136,7 +136,8 @@ def _affinity(node: str, require_amx: bool) -> str:
 def _annotations(annotations: dict, kind: str) -> str:
     pad = "  " if kind == "LLMInferenceService" else "    "
     return f"{pad}annotations:\n" + "".join(
-        f"{pad}  {k}: {quote(v) if v.isdigit() or v in ('true', 'false') else v}\n" for k, v in annotations.items())
+        f"{pad}  {k}: {quote(v) if v.isdigit() or v in ('true', 'false') or v.startswith(('[', '{')) else v}\n"
+        for k, v in annotations.items())
 
 
 def _volumes(m: Model) -> tuple[str, str]:
@@ -253,7 +254,8 @@ def manifest(m: Model, catalog: Catalog, o, annotations: dict, cpu: str, cli_arg
         "MODEL_NAME": m.name, "NAMESPACE": m.namespace, "MODEL_URI": m.uri, "CPU": cpu, "MEMORY": m.memory,
         "REPLICAS": m.replicas, "ARGS": _list([f"        - {quote(a)}" for a in dedupe_args(args + cli_args)]),
         "ENV": _env(m, catalog, cli_args, o.env),
-        "NRI_ANNOTATIONS": _annotations(annotations, m.kind) if annotations else "",
+        "NRI_ANNOTATIONS": _annotations({**annotations, **m.pod_annotations}, m.kind)
+        if annotations or m.pod_annotations else "",
         "AFFINITY": _affinity(m.node, catalog.require_amx and not m.gpu),
         "EXTRA_LABELS": "".join(f"\n    {p.split('=', 1)[0]}: {quote(p.split('=', 1)[1])}" for p in o.label),
     }

@@ -268,6 +268,9 @@ class KvOffload:
     pool_ip: str = ""                         # its RDMA NIC IP
     client_ip: str = ""                       # the GPU node's RDMA NIC IP
     port: str = ""                            # IAXL_RDMA_DAEMON_PORT
+    network: str = ""                         # namespace/name of the Multus network giving the vLLM pod an SR-IOV VF
+    network_resource: str = ""                # the extended resource that network's VFs are advertised as
+    client_cidr: str = ""                     # with network: client_ip/prefix, the pod's own address on it
     pool_cpu: str = ""                        # daemon vCPUs
     overhead_gb: int = 0                      # daemon memory per rank beside its pools
     pool_memory_gi: int = 0                   # daemon memory: (pool + scratch + overhead) x TP
@@ -316,6 +319,7 @@ class Model:
     kv: KvOffload | None = None
     host_network: bool = False
     extra_resources: dict = field(default_factory=dict)  # extended resources beside the accelerator
+    pod_annotations: dict = field(default_factory=dict)  # beside the CPU policy's, e.g. a Multus network
 
     @property
     def autoscaled(self) -> bool:

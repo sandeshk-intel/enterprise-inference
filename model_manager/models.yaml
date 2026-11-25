@@ -91,7 +91,8 @@ network:
 #                    (--speculative-config.model /mnt/models/draft).
 #   kv_offload:      vllm-cuda-kvshrink only: the KV-cache DDR pool per TP rank, in the pod or on
 #                    a pool node over RDMA (docs/customize/kv-offload.md)
-#                    {pool_gb: N, compression: cpu|off|qat|iaa|qat+iaa, remote: {node, ip, client_ip}}
+#                    {pool_gb: N, compression: cpu|off|qat|iaa|qat+iaa,
+#                     remote: {node, ip, client_ip[, network, network_resource]}}
 #   args: [ ... ]    extra engine args   (appended after category/version args)
 #   env:  { ... }    extra env vars      (merged over runtime env)
 #

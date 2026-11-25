@@ -194,14 +194,17 @@ def _pod(node: str, name: str, **requests) -> dict:
             "spec": {"nodeName": node, "containers": [{"resources": {"requests": requests}}]}}
 
 
-def _pool(name: str, client_node: str, pool_node: str, port: int) -> dict:
-    return {"metadata": {"name": name, "namespace": "llm-inference", "annotations": {
-        "model-manager/kv-pool": json.dumps({"client_node": client_node, "pool_node": pool_node, "port": port})}}}
+def _pool(name: str, client_node: str, pool_node: str, port: int, **footprint) -> dict:
+    return {"metadata": {"name": name, "namespace": "llm-inference", "annotations": {"model-manager/kv-pool": json.dumps(
+        {"client_node": client_node, "pool_node": pool_node, "port": port, **footprint})}}}
 
 
-def _cluster(monkeypatch, nodes: dict, pods=(), pools=(), enforce: str = ""):
-    """A fake cluster for the pre-flight: nodes' allocatable, running pods, other models' pool Deployments."""
+def _cluster(monkeypatch, nodes: dict, pods=(), pools=(), enforce: str = "", networks=("llm-inference/rdma-net",)):
+    """A fake cluster for the pre-flight: nodes' allocatable, running pods, other models' pool Deployments, Multus
+    networks."""
     def get_json(kind, name=None, *rest):
+        if kind.startswith("network-attachment-definitions"):
+            return {} if f"{rest[-1]}/{name}" in networks else None
         if kind == "namespace":
             return {"metadata": {"labels": {"pod-security.kubernetes.io/enforce": enforce} if enforce else {}}}
         if kind == "pods":
@@ -213,9 +216,14 @@ def _cluster(monkeypatch, nodes: dict, pods=(), pools=(), enforce: str = ""):
     monkeypatch.setattr(k8s, "get_json", get_json)
 
 
-def _errors(monkeypatch, tmp_path, **cluster) -> str:
-    m, _, _ = _deploy(monkeypatch, tmp_path, RDMA)
-    _cluster(monkeypatch, **{"nodes": {"gpu-node-1": {"rdma/hca": "63"}, "pool-node-1": POOL_NODE}, **cluster})
+NETWORK = {"node": "pool-node-1", "ip": "192.0.2.13", "client_ip": "192.0.2.21/24", "network": "rdma-net",
+           "network_resource": "nvidia.com/rdma_vf"}
+
+
+def _errors(monkeypatch, tmp_path, remote=None, **cluster) -> str:
+    m, _, _ = _deploy(monkeypatch, tmp_path, RDMA, **({"remote": remote} if remote else {}))
+    _cluster(monkeypatch, **{"nodes": {"gpu-node-1": {"rdma/hca": "63", "nvidia.com/rdma_vf": "8"},
+                                       "pool-node-1": POOL_NODE}, **cluster})
     return "\n".join(kv_offload.preflight(m, 1))
 
 
@@ -281,7 +289,8 @@ def test_iaxl_api_ports_follow_the_port_on_both_pods(monkeypatch, tmp_path):
         assert (env["IAXL_API_CONTROLLER_PORT"], env["IAXL_API_WORKER_BASE_PORT"]) == ("5571", "5572")
     assert pool["metadata"]["labels"]["app.kubernetes.io/component"] == "kv-pool"
     assert json.loads(pool["metadata"]["annotations"]["model-manager/kv-pool"]) == \
-        {"client_node": "gpu-node-1", "pool_node": "pool-node-1", "port": 5555}
+        {"client_node": "gpu-node-1", "pool_node": "pool-node-1", "port": 5555, "network": False,
+         "client_ip": "192.0.2.14"}
 
 
 def test_reconcile_applies_and_waits_for_the_daemon_and_a_local_pool_removes_it(monkeypatch, tmp_path):
@@ -308,6 +317,61 @@ def test_undeploy_removes_the_pool_daemon_of_a_kv_model_only(monkeypatch, tmp_pa
         cli._remove(m, wait=False, timeout=0)
     assert ("deployment", f"{RDMA}-kv-pool") in deleted
     assert not any(kind == "deployment" for kind, name in deleted if "qwen" in name)
+
+
+# ── Remote pool through an SR-IOV network (kv_offload.remote.network) ───────
+
+
+def test_network_mode_attaches_a_vf_with_a_static_address_instead_of_the_host_network(monkeypatch, tmp_path):
+    m, doc, pool = _deploy(monkeypatch, tmp_path, RDMA, remote=NETWORK)
+    spec = doc["spec"]["template"]
+    c = spec["containers"][0]
+    env = _env(c)
+    assert "hostNetwork" not in spec and "dnsPolicy" not in spec
+    assert json.loads(doc["spec"]["annotations"]["k8s.v1.cni.cncf.io/networks"]) == [
+        {"name": "rdma-net", "namespace": "llm-inference", "interface": "rdma0", "ips": ["192.0.2.21/24"]}]
+    assert c["resources"]["limits"] == {"memory": "64Gi", "nvidia.com/gpu": "1", "nvidia.com/rdma_vf": "1"}
+    assert (env["IAXL_RDMA_CLIENT_NIC_IPS"], env["KVSHRINK_RDMA_LOCAL_IP"]) == ("192.0.2.21", "192.0.2.21")
+    assert pool["spec"]["template"]["spec"]["hostNetwork"] is True  # the daemon stays on the pool node's NIC
+    assert json.loads(pool["metadata"]["annotations"]["model-manager/kv-pool"])["network"] is True
+
+
+def test_network_mode_does_not_need_the_gpu_node(monkeypatch, tmp_path):
+    monkeypatch.setenv("MM_CONFIG", str(_catalog(tmp_path, remote=NETWORK)))
+    m = config.resolve(Catalog.load(), RDMA, cli.Options())
+    m.node = ""
+    kv = kv_offload.resolve(m, 1)
+    assert (kv.network, kv.client_ip) == ("llm-inference/rdma-net", "192.0.2.21")
+
+
+@pytest.mark.parametrize("override, message", [
+    ({"network": "Bad_Name"}, "network must name a NetworkAttachmentDefinition"),
+    ({"network_resource": ""}, "network_resource must be the extended resource"),
+    ({"client_ip": "192.0.2.21"}, "client_ip is the vLLM pod's own address on it, with its prefix"),
+])
+def test_invalid_network_settings_abort(monkeypatch, tmp_path, capsys, override, message):
+    with pytest.raises(SystemExit):
+        _deploy(monkeypatch, tmp_path, RDMA, remote={**NETWORK, **override})
+    assert message in capsys.readouterr().err
+
+
+def test_network_mode_preflight_needs_the_network_and_a_free_vf(monkeypatch, tmp_path):
+    assert _errors(monkeypatch, tmp_path, remote=NETWORK) == ""
+    errors = _errors(monkeypatch, tmp_path, remote=NETWORK, networks=(),
+                     pods=[_pod("gpu-node-1", "other", **{"nvidia.com/rdma_vf": "8"})])
+    assert "Network llm-inference/rdma-net was not found" in errors
+    assert "Node gpu-node-1 has 0 nvidia.com/rdma_vf free of 8; the KV pool needs 1." in errors
+
+
+def test_network_mode_lets_several_remote_pool_models_share_a_gpu_node(monkeypatch, tmp_path):
+    host_net = _pool("model-a-kv-pool", "gpu-node-1", "pool-node-2", 6000)
+    other_vf = _pool("model-b-kv-pool", "gpu-node-1", "pool-node-1", 5587, network=True, client_ip="192.0.2.22")
+    assert _errors(monkeypatch, tmp_path, remote=NETWORK, pools=[host_net, other_vf]) == ""
+
+
+def test_network_mode_refuses_an_address_another_model_holds(monkeypatch, tmp_path):
+    taken = _pool("model-b-kv-pool", "gpu-node-2", "pool-node-2", 6000, network=True, client_ip="192.0.2.21")
+    assert "already uses 192.0.2.21 on the RDMA network" in _errors(monkeypatch, tmp_path, remote=NETWORK, pools=[taken])
 
 
 # ── The image's entrypoint wrapper ───────────────────────────────────────────
